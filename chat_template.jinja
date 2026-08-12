@@ -1,0 +1,452 @@
+{# ================================================================== #}
+{# State Model Interface (SMI) — Reference Jinja2 Chat Template       #}
+{#                                                                    #}
+{# This template is an interoperability serializer.                   #}
+{# Secure implementations SHOULD serialize SMI at token-ID level      #}
+{# and encode all untrusted payloads with special-token recognition   #}
+{# disabled.                                                          #}
+{# ================================================================== #}
+
+
+{# ------------------------------------------------------------------ #}
+{# Configuration                                                      #}
+{# ------------------------------------------------------------------ #}
+
+{%- set enable_thinking =
+    enable_thinking if enable_thinking is defined else true
+-%}
+
+{%- set preserve_thinking =
+    preserve_thinking if preserve_thinking is defined else true
+-%}
+
+{%- set has_tools =
+    tools is defined
+    and tools
+    and tools is iterable
+    and tools is not mapping
+-%}
+
+
+{# ------------------------------------------------------------------ #}
+{# Payload renderer                                                   #}
+{#                                                                    #}
+{# Non-text modalities SHOULD already be converted by the processor   #}
+{# into `smi_payload`. SMI itself does not define modality tokens.     #}
+{# ------------------------------------------------------------------ #}
+
+{%- macro render_content(value) -%}
+
+    {%- if value is string -%}
+
+        {{- value -}}
+
+    {%- elif value is mapping -%}
+
+        {%- if value.smi_payload is defined -%}
+
+            {{- value.smi_payload -}}
+
+        {%- elif value.text is defined -%}
+
+            {{- value.text -}}
+
+        {%- else -%}
+
+            {{- value | tojson -}}
+
+        {%- endif -%}
+
+    {%- elif value is iterable -%}
+
+        {%- for item in value -%}
+
+            {%- if item is string -%}
+
+                {{- item -}}
+
+            {%- elif item is mapping -%}
+
+                {%- if item.smi_payload is defined -%}
+
+                    {{- item.smi_payload -}}
+
+                {%- elif item.text is defined -%}
+
+                    {{- item.text -}}
+
+                {%- else -%}
+
+                    {{- raise_exception(
+                        'Unsupported multimodal content item. '
+                        ~ 'Preprocess non-text modalities into `smi_payload`.'
+                    ) -}}
+
+                {%- endif -%}
+
+            {%- else -%}
+
+                {{- item | string -}}
+
+            {%- endif -%}
+
+        {%- endfor -%}
+
+    {%- elif value is none or value is undefined -%}
+
+        {{- '' -}}
+
+    {%- else -%}
+
+        {{- value | string -}}
+
+    {%- endif -%}
+
+{%- endmacro -%}
+
+
+{# ------------------------------------------------------------------ #}
+{# Transmission state                                                 #}
+{#                                                                    #}
+{# runtime = CTRL/SYS/DEV/CAPS/USR/OBS                                #}
+{# model   = THINK/OUT/ACT                                            #}
+{#                                                                    #}
+{# EOT is emitted only when control changes side or the stream ends.  #}
+{# ------------------------------------------------------------------ #}
+
+{%- set ns = namespace(side='') -%}
+
+
+{# ------------------------------------------------------------------ #}
+{# Initial runtime control                                            #}
+{# ------------------------------------------------------------------ #}
+
+{%- if smi_ctrl is defined and smi_ctrl is not none -%}
+
+    {{- '<|ctrl|>\n' -}}
+
+    {%- if smi_ctrl is mapping -%}
+        {{- smi_ctrl | tojson -}}
+    {%- else -%}
+        {{- smi_ctrl -}}
+    {%- endif -%}
+
+    {{- '\n' -}}
+
+    {%- set ns.side = 'runtime' -%}
+
+{%- endif -%}
+
+
+{# ------------------------------------------------------------------ #}
+{# Initial capabilities                                               #}
+{#                                                                    #}
+{# `smi_caps` is the native SMI representation.                       #}
+{# `tools` is supported as an adapter for existing chat APIs.         #}
+{# ------------------------------------------------------------------ #}
+
+{%- if smi_caps is defined and smi_caps is not none -%}
+
+    {{- '<|caps|>\n' -}}
+
+    {%- if smi_caps is mapping or
+          (smi_caps is iterable and smi_caps is not string) -%}
+        {{- smi_caps | tojson -}}
+    {%- else -%}
+        {{- smi_caps -}}
+    {%- endif -%}
+
+    {{- '\n' -}}
+
+    {%- set ns.side = 'runtime' -%}
+
+{%- elif has_tools -%}
+
+    {{- '<|caps|>\n{"tools":' -}}
+    {{- tools | tojson -}}
+    {{- '}\n' -}}
+
+    {%- set ns.side = 'runtime' -%}
+
+{%- endif -%}
+
+
+{# ------------------------------------------------------------------ #}
+{# Conversation                                                       #}
+{# ------------------------------------------------------------------ #}
+
+{%- for message in messages -%}
+
+    {%- set is_model = message.role == 'assistant' -%}
+
+
+    {# -------------------------------------------------------------- #}
+    {# Runtime → Model boundary                                       #}
+    {# -------------------------------------------------------------- #}
+
+    {%- if is_model and ns.side == 'runtime' -%}
+
+        {{- '<|eot|>\n' -}}
+        {%- set ns.side = 'model' -%}
+
+    {%- elif not is_model and ns.side == 'model' -%}
+
+        {{- '<|eot|>\n' -}}
+        {%- set ns.side = 'runtime' -%}
+
+    {%- elif ns.side == '' -%}
+
+        {%- if is_model -%}
+            {%- set ns.side = 'model' -%}
+        {%- else -%}
+            {%- set ns.side = 'runtime' -%}
+        {%- endif -%}
+
+    {%- endif -%}
+
+
+    {# -------------------------------------------------------------- #}
+    {# System                                                         #}
+    {# -------------------------------------------------------------- #}
+
+    {%- if message.role == 'system' -%}
+
+        {{- '<|sys|>\n' -}}
+        {{- render_content(message.content) -}}
+        {{- '\n' -}}
+
+
+    {# -------------------------------------------------------------- #}
+    {# Developer                                                      #}
+    {# -------------------------------------------------------------- #}
+
+    {%- elif message.role == 'developer' -%}
+
+        {{- '<|dev|>\n' -}}
+        {{- render_content(message.content) -}}
+        {{- '\n' -}}
+
+
+    {# -------------------------------------------------------------- #}
+    {# User                                                           #}
+    {# -------------------------------------------------------------- #}
+
+    {%- elif message.role == 'user' -%}
+
+        {{- '<|usr|>\n' -}}
+        {{- render_content(message.content) -}}
+        {{- '\n' -}}
+
+
+    {# -------------------------------------------------------------- #}
+    {# Observation / tool result                                      #}
+    {# -------------------------------------------------------------- #}
+
+    {%- elif message.role == 'tool'
+          or message.role == 'observation' -%}
+
+        {{- '<|obs|>\n' -}}
+
+        {%- if message.tool_call_id is defined
+              and message.tool_call_id -%}
+
+            {{- '{"caused_by":' -}}
+            {{- message.tool_call_id | tojson -}}
+            {{- ',"content":' -}}
+
+            {%- if message.content is string -%}
+                {{- message.content | tojson -}}
+            {%- else -%}
+                {{- render_content(message.content) | tojson -}}
+            {%- endif -%}
+
+            {{- '}' -}}
+
+        {%- else -%}
+
+            {{- render_content(message.content) -}}
+
+        {%- endif -%}
+
+        {{- '\n' -}}
+
+
+    {# -------------------------------------------------------------- #}
+    {# Assistant                                                      #}
+    {# -------------------------------------------------------------- #}
+
+    {%- elif message.role == 'assistant' -%}
+
+
+        {# Private cognition ----------------------------------------- #}
+
+        {%- if preserve_thinking -%}
+
+            {%- if message.reasoning_content is defined
+                  and message.reasoning_content -%}
+
+                {{- '<|think|>\n' -}}
+                {{- message.reasoning_content -}}
+                {{- '\n' -}}
+
+            {%- elif message.thinking is defined
+                      and message.thinking -%}
+
+                {{- '<|think|>\n' -}}
+                {{- message.thinking -}}
+                {{- '\n' -}}
+
+            {%- endif -%}
+
+        {%- endif -%}
+
+
+        {# Informational output -------------------------------------- #}
+
+        {%- if message.content is defined
+              and message.content is not none -%}
+
+            {%- set rendered = render_content(message.content) -%}
+
+            {%- if rendered | trim -%}
+
+                {{- '<|out|>\n' -}}
+                {{- rendered -}}
+                {{- '\n' -}}
+
+            {%- endif -%}
+
+        {%- endif -%}
+
+
+        {# Actions / tool calls -------------------------------------- #}
+
+        {%- if message.tool_calls is defined
+              and message.tool_calls
+              and message.tool_calls is iterable
+              and message.tool_calls is not mapping -%}
+
+            {%- for tool_call in message.tool_calls -%}
+
+                {%- if tool_call.function is defined
+                      and tool_call.function is not none -%}
+
+                    {%- set tc = tool_call.function -%}
+
+                {%- else -%}
+
+                    {%- set tc = tool_call -%}
+
+                {%- endif -%}
+
+
+                {{- '<|act|>\n{' -}}
+
+
+                {# Action ID ----------------------------------------- #}
+
+                {%- if tool_call.id is defined
+                      and tool_call.id -%}
+
+                    {{- '"id":' -}}
+                    {{- tool_call.id | tojson -}}
+                    {{- ',' -}}
+
+                {%- endif -%}
+
+
+                {{- '"type":"tool",' -}}
+
+
+                {# Tool name ----------------------------------------- #}
+
+                {{- '"name":' -}}
+                {{- tc.name | tojson -}}
+                {{- ',' -}}
+
+
+                {# Arguments ----------------------------------------- #}
+
+                {{- '"arguments":' -}}
+
+                {%- if tc.arguments is mapping -%}
+
+                    {{- tc.arguments | tojson -}}
+
+                {%- elif tc.arguments is string
+                          and tc.arguments | trim -%}
+
+                    {# Existing APIs often provide arguments as        #}
+                    {# an already serialized JSON object.             #}
+                    {{- tc.arguments -}}
+
+                {%- else -%}
+
+                    {{- '{}' -}}
+
+                {%- endif -%}
+
+
+                {{- '}\n' -}}
+
+            {%- endfor -%}
+
+        {%- endif -%}
+
+
+    {# -------------------------------------------------------------- #}
+    {# Unsupported role                                               #}
+    {# -------------------------------------------------------------- #}
+
+    {%- else -%}
+
+        {{- raise_exception(
+            'Unsupported SMI role: ' ~ message.role
+        ) -}}
+
+    {%- endif -%}
+
+{%- endfor -%}
+
+
+{# ------------------------------------------------------------------ #}
+{# Generation prompt / final transmission boundary                    #}
+{# ------------------------------------------------------------------ #}
+
+{%- if add_generation_prompt -%}
+
+    {# The history must hand control to the model before generation. #}
+
+    {%- if ns.side == 'runtime' -%}
+
+        {{- '<|eot|>\n' -}}
+        {%- set ns.side = 'model' -%}
+
+    {%- elif ns.side == 'model' -%}
+
+        {{- '<|eot|>\n' -}}
+
+    {%- endif -%}
+
+
+    {%- if enable_thinking -%}
+
+        {{- '<|think|>\n' -}}
+
+    {%- else -%}
+
+        {{- '<|out|>\n' -}}
+
+    {%- endif -%}
+
+{%- else -%}
+
+    {# Close the final completed transmission. #}
+
+    {%- if ns.side != '' -%}
+
+        {{- '<|eot|>\n' -}}
+
+    {%- endif -%}
+
+{%- endif -%}
