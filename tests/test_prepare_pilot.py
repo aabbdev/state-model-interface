@@ -230,6 +230,7 @@ def test_cli_defaults_and_quota_validation() -> None:
     assert args.max_length == 2048
     assert args.max_serialized_chars is None
     assert args.shuffle_buffer == 10_000
+    assert args.workers == 16
     assert args.minimum_code_score == 0.8
     assert _quota_overrides(["aya=12"]) == {"aya": 12}
     with pytest.raises(ValueError):
@@ -380,6 +381,7 @@ def test_prepare_writes_simple_parquet_and_manifest_offline(tmp_path: Path) -> N
     assert manifest["complete"] is True
     assert manifest["target_tokens"] == target_tokens
     assert manifest["max_serialized_chars"] == 16_000
+    assert manifest["workers"] == 1
     assert len(manifest["output_sha256"]) == 64
     assert json.loads(manifest_path.read_text()) == manifest
     with pytest.raises(FileExistsError, match="overwrite"):
@@ -395,6 +397,23 @@ def test_prepare_writes_simple_parquet_and_manifest_offline(tmp_path: Path) -> N
             minimum_code_score=0.8,
             row_provider=rows,
         )
+
+    parallel_output = tmp_path / "pilot-parallel.parquet"
+    parallel_manifest = prepare(
+        output=parallel_output,
+        manifest_path=tmp_path / "parallel-manifest.json",
+        sources=[source],
+        tokenizer=ByteTokenizer(),
+        max_length=1000,
+        seed=7,
+        shuffle_buffer=8,
+        row_group_size=1,
+        minimum_code_score=0.8,
+        workers=4,
+        row_provider=rows,
+    )
+    assert pq.read_table(parallel_output).to_pylist() == table.to_pylist()
+    assert parallel_manifest["workers"] == 4
 
 
 def test_prepare_rejects_oversized_text_before_tokenization(tmp_path: Path) -> None:

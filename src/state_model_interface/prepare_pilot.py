@@ -11,8 +11,11 @@ import math
 import os
 import random
 import re
+from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +42,15 @@ class SourceSpec:
     quota: int
     adapter: str
     data_url: str | tuple[str, ...] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedPilotRow:
+    rejection: str | None
+    fingerprint: bytes | None = None
+    messages_json: str | None = None
+    tools_json: str | None = None
+    target_tokens: int = 0
 
 
 DEFAULT_SOURCES: tuple[SourceSpec, ...] = (
@@ -584,6 +596,73 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _prepare_row(
+    row: Any,
+    *,
+    adapter: Adapter,
+    tokenizer: Any,
+    token_ids: Mapping[str, int],
+    max_length: int,
+    max_serialized_chars: int,
+) -> PreparedPilotRow:
+    try:
+        if not isinstance(row, Mapping):
+            raise TypeError("row is not an object")
+        messages, tools = adapter(row)
+        canonical_messages = _canonical_json(messages)
+        canonical_tools = _canonical_json(tools)
+        if len(canonical_messages) + len(canonical_tools) > max_serialized_chars:
+            return PreparedPilotRow("oversized_text")
+        fingerprint = _digest(messages, tools)
+        compiled = compile_smi(
+            tokenizer,
+            messages,
+            tools=tools or None,
+            token_ids=token_ids,
+        )
+        if len(compiled.input_ids) > max_length:
+            return PreparedPilotRow("too_long")
+        target_tokens = sum(label != -100 for label in compiled.labels)
+        if target_tokens == 0:
+            return PreparedPilotRow("no_target")
+        return PreparedPilotRow(
+            None,
+            fingerprint,
+            canonical_messages,
+            canonical_tools,
+            target_tokens,
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return PreparedPilotRow("invalid")
+
+
+def _bounded_ordered_map(
+    function: Callable[[Any], PreparedPilotRow],
+    rows: Iterable,
+    executor: ThreadPoolExecutor,
+    *,
+    prefetch: int,
+) -> Iterable[PreparedPilotRow]:
+    iterator = iter(rows)
+    pending: deque[Future[PreparedPilotRow]] = deque()
+    for row in itertools.islice(iterator, prefetch):
+        pending.append(executor.submit(function, row))
+    try:
+        while pending:
+            yield pending.popleft().result()
+            try:
+                row = next(iterator)
+            except StopIteration:
+                continue
+            pending.append(executor.submit(function, row))
+    finally:
+        for future in pending:
+            future.cancel()
+        close = getattr(iterator, "close", None)
+        if close is not None:
+            close()
+
+
 def prepare(
     *,
     output: Path,
@@ -592,6 +671,7 @@ def prepare(
     tokenizer: Any,
     max_length: int,
     max_serialized_chars: int | None = None,
+    workers: int = 1,
     seed: int,
     shuffle_buffer: int,
     row_group_size: int,
@@ -602,7 +682,7 @@ def prepare(
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    if max_length <= 0 or row_group_size <= 0 or shuffle_buffer <= 0:
+    if max_length <= 0 or row_group_size <= 0 or shuffle_buffer <= 0 or workers <= 0:
         raise ValueError("length and buffer sizes must be positive")
     if max_serialized_chars is None:
         max_serialized_chars = max_length * 16
@@ -637,6 +717,7 @@ def prepare(
     buffer: list[dict[str, Any]] = []
     total_rows = 0
     writer = pq.ParquetWriter(temporary_output, schema, compression="zstd")
+    executor = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
 
     def reject(source_name: str, reason: str) -> None:
         rejected = stats[source_name]["rejected"]
@@ -658,8 +739,26 @@ def prepare(
             rows = row_provider(
                 source, seed=seed + source_index, buffer_size=shuffle_buffer
             )
+            prepare_row = partial(
+                _prepare_row,
+                adapter=adapter,
+                tokenizer=tokenizer,
+                token_ids=token_ids,
+                max_length=max_length,
+                max_serialized_chars=max_serialized_chars,
+            )
+            prepared_rows = (
+                map(prepare_row, rows)
+                if executor is None
+                else _bounded_ordered_map(
+                    prepare_row,
+                    rows,
+                    executor,
+                    prefetch=workers * 4,
+                )
+            )
             source_seen = 0
-            for row in rows:
+            for prepared in prepared_rows:
                 if stats[source.name]["target_tokens"] >= source.quota:
                     break
                 source_seen += 1
@@ -670,52 +769,32 @@ def prepare(
                         f"{stats[source.name]['target_tokens']} tokens",
                         flush=True,
                     )
-                try:
-                    if not isinstance(row, Mapping):
-                        raise TypeError("row is not an object")
-                    messages, tools = adapter(row)
-                    canonical_messages = _canonical_json(messages)
-                    canonical_tools = _canonical_json(tools)
-                    if (
-                        len(canonical_messages) + len(canonical_tools)
-                        > max_serialized_chars
-                    ):
-                        reject(source.name, "oversized_text")
-                        continue
-                    fingerprint = _digest(messages, tools)
-                    if fingerprint in seen:
-                        reject(source.name, "duplicate")
-                        continue
-                    compiled = compile_smi(
-                        tokenizer,
-                        messages,
-                        tools=tools or None,
-                        token_ids=token_ids,
-                    )
-                    if len(compiled.input_ids) > max_length:
-                        reject(source.name, "too_long")
-                        continue
-                    target_tokens = sum(label != -100 for label in compiled.labels)
-                    if target_tokens == 0:
-                        reject(source.name, "no_target")
-                        continue
-                except (KeyError, TypeError, ValueError, OverflowError):
-                    reject(source.name, "invalid")
+                if prepared.rejection is not None:
+                    reject(source.name, prepared.rejection)
                     continue
-                seen.add(fingerprint)
+                assert prepared.fingerprint is not None
+                assert prepared.messages_json is not None
+                assert prepared.tools_json is not None
+                if prepared.fingerprint in seen:
+                    reject(source.name, "duplicate")
+                    continue
+                seen.add(prepared.fingerprint)
                 buffer.append(
                     {
-                        "messages_json": canonical_messages,
-                        "tools_json": canonical_tools,
+                        "messages_json": prepared.messages_json,
+                        "tools_json": prepared.tools_json,
                         "source": source.name,
-                        "target_tokens": target_tokens,
+                        "target_tokens": prepared.target_tokens,
                     }
                 )
-                stats[source.name]["target_tokens"] += target_tokens
+                stats[source.name]["target_tokens"] += prepared.target_tokens
                 stats[source.name]["rows"] += 1
                 total_rows += 1
                 if len(buffer) >= row_group_size:
                     flush()
+            close_prepared = getattr(prepared_rows, "close", None)
+            if close_prepared is not None:
+                close_prepared()
             print(
                 f"source {source.name}: complete after {source_seen} rows; accepted "
                 f"{stats[source.name]['rows']} rows / "
@@ -724,6 +803,8 @@ def prepare(
             )
         flush()
     finally:
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
         writer.close()
 
     temporary_output.rename(output)
@@ -738,6 +819,7 @@ def prepare(
         "max_length": max_length,
         "max_serialized_chars": max_serialized_chars,
         "source_cache": os.environ.get("SMI_PILOT_SOURCE_CACHE"),
+        "workers": workers,
         "seed": seed,
         "shuffle_buffer": shuffle_buffer,
         "total_rows": total_rows,
@@ -770,6 +852,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--shuffle-buffer", type=int, default=10_000)
     parser.add_argument("--row-group-size", type=int, default=1024)
+    parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--minimum-code-score", type=float, default=0.8)
     parser.add_argument(
         "--quota",
@@ -803,6 +886,7 @@ def main(argv: list[str] | None = None) -> None:
         tokenizer=tokenizer,
         max_length=args.max_length,
         max_serialized_chars=args.max_serialized_chars,
+        workers=args.workers,
         seed=args.seed,
         shuffle_buffer=args.shuffle_buffer,
         row_group_size=args.row_group_size,
