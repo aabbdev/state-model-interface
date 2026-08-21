@@ -14,6 +14,7 @@ from state_model_interface.prepare_pilot import (
     TOKENIZER_REVISION,
     TOTAL_TARGET_TOKENS,
     SourceSpec,
+    _maximum_decoded_token_chars,
     _quota_overrides,
     adapt_aya,
     adapt_hermes,
@@ -43,6 +44,21 @@ class ByteTokenizer:
 
     def convert_tokens_to_ids(self, token: str) -> int:
         return self.vocab.get(token, -1)
+
+    def __len__(self) -> int:
+        return len(self.vocab)
+
+    def decode(
+        self,
+        token_ids: list[int],
+        *,
+        skip_special_tokens: bool,
+        clean_up_tokenization_spaces: bool,
+    ) -> str:
+        assert skip_special_tokens is False
+        assert clean_up_tokenization_spaces is False
+        inverse = {token_id: token for token, token_id in self.vocab.items()}
+        return "".join(inverse[token_id] for token_id in token_ids)
 
     def encode(
         self,
@@ -218,6 +234,12 @@ def test_cli_defaults_and_quota_validation() -> None:
         _quota_overrides(["unknown=1"])
 
 
+def test_maximum_token_span_is_derived_from_decoding() -> None:
+    tokenizer = ByteTokenizer()
+    tokenizer.vocab["x" * 128] = len(tokenizer.vocab)
+    assert _maximum_decoded_token_chars(tokenizer) == 128
+
+
 def test_prepare_writes_simple_parquet_and_manifest_offline(tmp_path: Path) -> None:
     tokenizer = ByteTokenizer()
     token_ids = install_smi_tokens(tokenizer)
@@ -286,3 +308,33 @@ def test_prepare_writes_simple_parquet_and_manifest_offline(tmp_path: Path) -> N
             minimum_code_score=0.8,
             row_provider=rows,
         )
+
+
+def test_prepare_rejects_oversized_text_before_tokenization(tmp_path: Path) -> None:
+    tokenizer = ByteTokenizer()
+    source = SourceSpec(
+        "aya",
+        "offline/aya",
+        "default",
+        "train",
+        "a" * 40,
+        "Apache-2.0",
+        1,
+        "aya",
+    )
+
+    manifest = prepare(
+        output=tmp_path / "pilot.parquet",
+        manifest_path=tmp_path / "manifest.json",
+        sources=[source],
+        tokenizer=tokenizer,
+        max_length=64,
+        seed=7,
+        shuffle_buffer=8,
+        row_group_size=1,
+        minimum_code_score=0.8,
+        row_provider=lambda *args, **kwargs: [{"inputs": "Q", "targets": "x" * 3_000}],
+    )
+
+    assert manifest["total_rows"] == 0
+    assert manifest["sources"][0]["rejected"] == {"oversized_text": 1}

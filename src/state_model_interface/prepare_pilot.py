@@ -485,6 +485,22 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _maximum_decoded_token_chars(tokenizer: Any) -> int:
+    maximum = max(
+        len(
+            tokenizer.decode(
+                [token_id],
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+        )
+        for token_id in range(len(tokenizer))
+    )
+    if maximum <= 0:
+        raise ValueError("tokenizer has no non-empty decoded token")
+    return maximum
+
+
 def prepare(
     *,
     output: Path,
@@ -512,6 +528,7 @@ def prepare(
     if temporary_output.exists():
         raise FileExistsError(f"incomplete mixture already exists: {temporary_output}")
     token_ids = install_smi_tokens(tokenizer)
+    maximum_token_chars = _maximum_decoded_token_chars(tokenizer)
     schema = pa.schema(
         [
             ("messages_json", pa.string()),
@@ -549,19 +566,35 @@ def prepare(
         for source_index, source in enumerate(source_order):
             if source.quota == 0:
                 continue
+            print(f"source {source.name}: target {source.quota} tokens", flush=True)
             adapter = _adapter(source, minimum_code_score)
             rows = row_provider(
                 source, seed=seed + source_index, buffer_size=shuffle_buffer
             )
+            source_seen = 0
             for row in rows:
                 if stats[source.name]["target_tokens"] >= source.quota:
                     break
+                source_seen += 1
+                if source_seen % 1_000 == 0:
+                    print(
+                        f"source {source.name}: seen {source_seen}, accepted "
+                        f"{stats[source.name]['rows']} rows / "
+                        f"{stats[source.name]['target_tokens']} tokens",
+                        flush=True,
+                    )
                 try:
                     if not isinstance(row, Mapping):
                         raise TypeError("row is not an object")
                     messages, tools = adapter(row)
                     canonical_messages = _canonical_json(messages)
                     canonical_tools = _canonical_json(tools)
+                    if (
+                        len(canonical_messages) + len(canonical_tools)
+                        > max_length * maximum_token_chars
+                    ):
+                        reject(source.name, "oversized_text")
+                        continue
                     fingerprint = _digest(messages, tools)
                     if fingerprint in seen:
                         reject(source.name, "duplicate")
@@ -596,6 +629,12 @@ def prepare(
                 total_rows += 1
                 if len(buffer) >= row_group_size:
                     flush()
+            print(
+                f"source {source.name}: complete after {source_seen} rows; accepted "
+                f"{stats[source.name]['rows']} rows / "
+                f"{stats[source.name]['target_tokens']} tokens",
+                flush=True,
+            )
         flush()
     finally:
         writer.close()
