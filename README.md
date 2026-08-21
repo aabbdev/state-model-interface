@@ -827,6 +827,10 @@ SMI_PILOT_SOURCE_CACHE=/root/autodl-tmp/data/smi-pilot-source-cache \
   --output /root/autodl-tmp/data/smi-pilot-10m.parquet
 ```
 
+On the documented GPUHub layout, `scripts/launch_cached_gpu_pilot.sh` waits for
+that cache, starts preprocessing locally, deletes the raw cache after validating
+the 10M-token manifest, and then hands off to the TileLang training launcher.
+
 The dataset must contain a `messages` column in Hugging Face conversational format.
 Optional columns are `tools`, `smi_ctrl`, `smi_caps`, and
 `chat_template_kwargs`. The training command:
