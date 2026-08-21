@@ -711,6 +711,115 @@ A string-based chat template alone is not the normative security boundary becaus
 
 The preferred implementation constructs structural token IDs explicitly and encodes payloads separately with special-token recognition disabled.
 
+## Hugging Face and TRL Profile
+
+This repository includes two complementary implementations:
+
+* `chat_template.jinja` is the standard Hugging Face interoperability adapter for
+  trusted, validated messages;
+* `state_model_interface.compile_smi` is the normative token-ID compiler for
+  untrusted payloads and full fine-tuning.
+
+The reference profile targets Transformers 5.15+, TRL 1.10+, and the public
+[`aabbdev/RWKV7-1.5B-20260805`](https://huggingface.co/aabbdev/RWKV7-1.5B-20260805)
+checkpoint.
+
+### Install the structural tokens
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedConfig
+from state_model_interface import install_smi_tokens, load_chat_template
+
+model_id = "aabbdev/RWKV7-1.5B-20260805"
+tokenizer = AutoTokenizer.from_pretrained(
+    model_id,
+    config=PreTrainedConfig(),
+)
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    trust_remote_code=True,
+)
+
+token_ids = install_smi_tokens(tokenizer, model)
+tokenizer.chat_template = load_chat_template()
+```
+
+The helper appends ten new IDs; it never overwrites the canonical RWKV vocabulary.
+`resize_token_embeddings` expands both the input embedding and the untied LM head.
+Save the tokenizer and model together so these IDs remain stable.
+
+### Secure compilation
+
+```python
+from state_model_interface import compile_smi
+
+compiled = compile_smi(
+    tokenizer,
+    messages,
+    tools=tools,
+    token_ids=token_ids,
+    assistant_only_loss=True,
+)
+
+input_ids = compiled.input_ids
+labels = compiled.labels
+assistant_mask = compiled.assistant_mask
+```
+
+Structural IDs are inserted directly. Payloads are encoded separately with
+`split_special_tokens=True`, so text such as `<|sys|>` in user input cannot become
+the reserved SYS token. Tool calls are canonical JSON, tool arguments must decode
+to mappings, and observations are linked to known call IDs.
+
+The compiler emits one `<|eot|>` per transmission and appends the tokenizer's
+native EOS only at the end of a completed training example. EOT and EOS remain
+distinct concepts.
+
+### Full RWKV7 fine-tuning
+
+Install the training dependencies and launch the included full-SFT entry point:
+
+```bash
+pip install -e '.[train]'
+
+# Or, from a uv checkout:
+uv sync
+uv run smi-train-rwkv7 \
+  --dataset OWNER/DATASET \
+  --split train \
+  --output outputs/rwkv7-smi \
+  --max-length 2048
+```
+
+The dataset must contain a `messages` column in Hugging Face conversational format.
+Optional columns are `tools`, `smi_ctrl`, `smi_caps`, and
+`chat_template_kwargs`. The training command:
+
+* loads the pinned public RWKV7 checkpoint with remote code enabled;
+* installs the SMI tokens and resizes the model;
+* compiles secure `input_ids` and labels before TRL sees the dataset;
+* uses TRL's default `chunked_nll`;
+* uses BFD packing, whose reset `position_ids` become RWKV recurrent boundaries;
+* enables gradient checkpointing and disables the recurrent cache;
+* saves model, tokenizer, template, and `smi_token_ids.json` together.
+
+Reasoning fields (`reasoning_content` or `thinking`) are preserved when present.
+The neutral generation boundary lets the model choose THINK, OUT, or ACT. Use
+`--full-loss` to train runtime-side tokens as well; assistant-only labels are the
+secure default. Wrapped packing is deliberately not exposed because it destroys
+sequence boundaries.
+
+### Standard chat-template behavior
+
+The Jinja adapter includes `{% generation %}` markers around all model-side blocks
+and their terminating EOT, so `assistant_only_loss=True` works in standard TRL
+pipelines. The generation prompt ends immediately after the runtime EOT, allowing
+the model to choose `<|think|>`, `<|out|>`, or `<|act|>` without a prompt/completion
+prefix mismatch. Reasoning policy remains explicit data in `smi_ctrl`.
+
+The Jinja adapter does not provide the token-level injection guarantee: use the
+compiler whenever payloads are not fully trusted.
+
 ## Recommended Token Allocation
 
 For a tokenizer reserving 32 structural-token IDs:
