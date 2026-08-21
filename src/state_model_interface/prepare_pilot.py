@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import itertools
 import json
 import math
+import os
 import random
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -21,6 +23,7 @@ TOKENIZER_REVISION = "5904f9d1cdb05a565e5da9304db0447c8a8eb938"
 NEMOTRON_REVISION = "7c804833427f633ccd53b582dbf02525fd680f78"
 OPENR1_REVISION = "e4e141ec9dea9f8326f4d347be56105859b2bd68"
 OPENCODE_REVISION = "8f3ba5bafe4d6e8db46082cf7ae6741bc370604d"
+MAX_OPEN_DIRECT_SHARDS = 8
 
 
 @dataclass(frozen=True, slots=True)
@@ -445,28 +448,103 @@ def _adapter(spec: SourceSpec, minimum_code_score: float) -> Adapter:
     return adapters[spec.adapter]
 
 
-def _source_rows(spec: SourceSpec, *, seed: int, buffer_size: int) -> Iterable:
-    from datasets import load_dataset
+def _buffered_shuffle(rows: Iterable, *, seed: int, buffer_size: int) -> Iterable:
+    rng = random.Random(seed)
+    buffer: list[Any] = []
+    iterator = iter(rows)
+    for _ in range(buffer_size):
+        try:
+            buffer.append(next(iterator))
+        except StopIteration:
+            break
+    for row in iterator:
+        index = rng.randrange(len(buffer))
+        yield buffer[index]
+        buffer[index] = row
+    rng.shuffle(buffer)
+    yield from buffer
 
+
+def _single_url_rows(url: str) -> Iterable:
+    import fsspec
+    import pyarrow.parquet as pq
+
+    source_cache = os.environ.get("SMI_PILOT_SOURCE_CACHE")
+    if source_cache:
+        cached = _cached_url_path(url, Path(source_cache))
+        if not cached.is_file():
+            raise FileNotFoundError(f"missing cached pilot source: {cached}")
+        url = cached.as_uri()
+    if url.endswith(".parquet"):
+        with fsspec.open(
+            url, "rb", block_size=8 * 1024 * 1024, cache_type="readahead"
+        ) as stream:
+            parquet = pq.ParquetFile(stream)
+            for batch in parquet.iter_batches(batch_size=256):
+                yield from batch.to_pylist()
+    else:
+        with fsspec.open(
+            url,
+            "rt",
+            encoding="utf-8",
+            block_size=8 * 1024 * 1024,
+            cache_type="readahead",
+        ) as stream:
+            for line in stream:
+                if line.strip():
+                    yield json.loads(line)
+
+
+def _cached_url_path(url: str, cache_root: Path) -> Path:
+    suffix = Path(url.partition("?")[0]).suffix
+    digest = hashlib.sha256(url.encode()).hexdigest()
+    return cache_root / f"{digest}{suffix}"
+
+
+def _direct_rows(urls: Sequence[str], *, seed: int) -> Iterable:
+    ordered_urls = list(urls)
+    random.Random(seed).shuffle(ordered_urls)
+    pending = iter(ordered_urls)
+    active = [
+        iter(_single_url_rows(url))
+        for url in itertools.islice(pending, MAX_OPEN_DIRECT_SHARDS)
+    ]
+    try:
+        while active:
+            next_active = []
+            for iterator in active:
+                try:
+                    yield next(iterator)
+                    next_active.append(iterator)
+                except StopIteration:
+                    replacement = next(pending, None)
+                    if replacement is not None:
+                        next_active.append(iter(_single_url_rows(replacement)))
+            active = next_active
+    finally:
+        for iterator in active:
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                close()
+
+
+def _source_rows(spec: SourceSpec, *, seed: int, buffer_size: int) -> Iterable:
     if spec.data_url:
         data_urls = (
             (spec.data_url,) if isinstance(spec.data_url, str) else spec.data_url
         )
-        data_format = "parquet" if data_urls[0].endswith(".parquet") else "json"
-        dataset = load_dataset(
-            data_format,
-            data_files={spec.split: list(data_urls)},
-            split=spec.split,
-            streaming=True,
+        return _buffered_shuffle(
+            _direct_rows(data_urls, seed=seed), seed=seed, buffer_size=buffer_size
         )
-    else:
-        dataset = load_dataset(
-            spec.dataset,
-            spec.config,
-            split=spec.split,
-            revision=spec.revision,
-            streaming=True,
-        )
+    from datasets import load_dataset
+
+    dataset = load_dataset(
+        spec.dataset,
+        spec.config,
+        split=spec.split,
+        revision=spec.revision,
+        streaming=True,
+    )
     return dataset.shuffle(seed=seed, buffer_size=buffer_size)
 
 
@@ -659,6 +737,7 @@ def prepare(
         "tokenizer_revision": TOKENIZER_REVISION,
         "max_length": max_length,
         "max_serialized_chars": max_serialized_chars,
+        "source_cache": os.environ.get("SMI_PILOT_SOURCE_CACHE"),
         "seed": seed,
         "shuffle_buffer": shuffle_buffer,
         "total_rows": total_rows,

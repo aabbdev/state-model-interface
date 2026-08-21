@@ -36,6 +36,27 @@ if [[ -e "$output" ]]; then
     exit 1
 fi
 
+if [[ "${SMI_DELETE_SOURCE_CACHE_AFTER_PREP:-0}" == "1" ]]; then
+    source_cache="${SMI_PILOT_SOURCE_CACHE:?source cache path is required}"
+    python - "$manifest" "$source_cache" <<'PY'
+import json
+import shutil
+import sys
+from pathlib import Path
+
+data_root = Path("/root/autodl-tmp/data").resolve(strict=True)
+target = Path(sys.argv[2]).resolve(strict=True)
+with open(sys.argv[1], encoding="utf-8") as stream:
+    recorded = Path(json.load(stream)["source_cache"]).resolve(strict=True)
+if target != recorded:
+    raise SystemExit(f"source cache differs from manifest: {target} != {recorded}")
+if target == data_root or not target.is_relative_to(data_root):
+    raise SystemExit(f"refusing unsafe source-cache deletion: {target}")
+shutil.rmtree(target)
+print(f"deleted source cache: {target}")
+PY
+fi
+
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 exec smi-train-rwkv7 \

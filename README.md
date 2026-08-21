@@ -817,6 +817,16 @@ at `max_length * 16` characters by default; override this with
 `--max-serialized-chars`. Use repeatable `--quota SOURCE=TOKENS` options to make a
 smaller smoke mixture.
 
+For unreliable or rate-limited Hub access, cache immutable direct shards first:
+
+```bash
+uv run python scripts/cache_pilot_sources.py \
+  --cache /root/autodl-tmp/data/smi-pilot-source-cache
+SMI_PILOT_SOURCE_CACHE=/root/autodl-tmp/data/smi-pilot-source-cache \
+  uv run smi-prepare-pilot \
+  --output /root/autodl-tmp/data/smi-pilot-10m.parquet
+```
+
 The dataset must contain a `messages` column in Hugging Face conversational format.
 Optional columns are `tools`, `smi_ctrl`, `smi_caps`, and
 `chat_template_kwargs`. The training command:

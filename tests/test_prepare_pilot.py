@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import itertools
 import json
 from pathlib import Path
 from typing import Any
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
@@ -14,7 +16,9 @@ from state_model_interface.prepare_pilot import (
     TOKENIZER_REVISION,
     TOTAL_TARGET_TOKENS,
     SourceSpec,
+    _cached_url_path,
     _quota_overrides,
+    _source_rows,
     adapt_aya,
     adapt_hermes,
     adapt_nemotron,
@@ -230,6 +234,96 @@ def test_cli_defaults_and_quota_validation() -> None:
     assert _quota_overrides(["aya=12"]) == {"aya": 12}
     with pytest.raises(ValueError):
         _quota_overrides(["unknown=1"])
+
+
+def test_direct_jsonl_rows_are_streamed_and_shuffled(tmp_path: Path) -> None:
+    source_path = tmp_path / "rows.jsonl"
+    source_path.write_text("\n".join(json.dumps({"value": i}) for i in range(5)))
+    source = SourceSpec(
+        "direct",
+        "offline/direct",
+        None,
+        "train",
+        "a" * 40,
+        "MIT",
+        1,
+        "aya",
+        source_path.as_uri(),
+    )
+
+    rows = list(_source_rows(source, seed=7, buffer_size=2))
+
+    assert sorted(row["value"] for row in rows) == list(range(5))
+    assert [row["value"] for row in rows] != list(range(5))
+
+
+def test_direct_parquet_rows_are_streamed(tmp_path: Path) -> None:
+    source_path = tmp_path / "rows.parquet"
+    pq.write_table(pa.Table.from_pylist([{"value": i} for i in range(5)]), source_path)
+    source = SourceSpec(
+        "direct",
+        "offline/direct",
+        None,
+        "train",
+        "a" * 40,
+        "MIT",
+        1,
+        "aya",
+        source_path.as_uri(),
+    )
+
+    rows = list(_source_rows(source, seed=7, buffer_size=2))
+
+    assert sorted(row["value"] for row in rows) == list(range(5))
+
+
+def test_direct_shards_are_interleaved_before_quota_sampling(tmp_path: Path) -> None:
+    urls = []
+    for shard in range(3):
+        source_path = tmp_path / f"rows-{shard}.jsonl"
+        source_path.write_text(
+            "\n".join(json.dumps({"shard": shard, "row": row}) for row in range(10))
+        )
+        urls.append(source_path.as_uri())
+    source = SourceSpec(
+        "direct",
+        "offline/direct",
+        None,
+        "train",
+        "a" * 40,
+        "MIT",
+        1,
+        "aya",
+        tuple(urls),
+    )
+
+    first_rows = list(itertools.islice(_source_rows(source, seed=7, buffer_size=2), 9))
+
+    assert {row["shard"] for row in first_rows} == {0, 1, 2}
+
+
+def test_direct_rows_use_complete_local_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remote_url = "https://example.invalid/rows.jsonl"
+    cache_root = tmp_path / "cache"
+    cache_root.mkdir()
+    cached = _cached_url_path(remote_url, cache_root)
+    cached.write_text(json.dumps({"value": 7}) + "\n")
+    monkeypatch.setenv("SMI_PILOT_SOURCE_CACHE", str(cache_root))
+    source = SourceSpec(
+        "direct",
+        "offline/direct",
+        None,
+        "train",
+        "a" * 40,
+        "MIT",
+        1,
+        "aya",
+        remote_url,
+    )
+
+    assert list(_source_rows(source, seed=7, buffer_size=2)) == [{"value": 7}]
 
 
 def test_prepare_writes_simple_parquet_and_manifest_offline(tmp_path: Path) -> None:
