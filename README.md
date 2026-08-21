@@ -801,6 +801,7 @@ Optional columns are `tools`, `smi_ctrl`, `smi_caps`, and
 * installs the SMI tokens and resizes the model;
 * compiles secure `input_ids` and labels before TRL sees the dataset;
 * uses TRL's default `chunked_nll`;
+* selects RWKV's differentiable `chunked` recurrence for sequence training;
 * uses BFD packing, whose reset `position_ids` become RWKV recurrent boundaries;
 * enables gradient checkpointing and disables the recurrent cache;
 * saves model, tokenizer, template, and `smi_token_ids.json` together.

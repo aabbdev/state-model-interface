@@ -40,6 +40,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-packing", action="store_true")
     parser.add_argument("--no-gradient-checkpointing", action="store_true")
     parser.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
+    parser.add_argument(
+        "--wkv-implementation", choices=("chunked", "eager"), default="chunked"
+    )
     parser.add_argument("--resume-from-checkpoint")
     return parser.parse_args(argv)
 
@@ -69,6 +72,7 @@ def main(argv: list[str] | None = None) -> None:
         dtype=dtype,
     )
     model.config.use_cache = False
+    model.config.wkv_implementation = args.wkv_implementation
     token_ids = install_smi_tokens(tokenizer, model)
     tokenizer.chat_template = load_chat_template(args.chat_template)
 
@@ -179,6 +183,22 @@ def main(argv: list[str] | None = None) -> None:
     )
     args.output.joinpath("smi_token_ids.json").write_text(
         json.dumps(token_ids, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    args.output.joinpath("smi_training_config.json").write_text(
+        json.dumps(
+            {
+                "base_model": args.model,
+                "base_revision": args.revision,
+                "wkv_implementation": args.wkv_implementation,
+                "max_length": args.max_length,
+                "packing": not args.no_packing,
+                "assistant_only_loss": not args.full_loss,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
         encoding="utf-8",
     )
 

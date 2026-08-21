@@ -18,3 +18,4 @@ def test_training_cli_defaults_to_pinned_model_and_tensorboard() -> None:
     assert args.logging_steps == 10
     assert args.no_packing is False
     assert args.no_gradient_checkpointing is False
+    assert args.wkv_implementation == "chunked"
