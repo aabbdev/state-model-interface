@@ -41,6 +41,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=2e-5)
+    parser.add_argument("--save-steps", type=int, default=500)
+    parser.add_argument("--save-total-limit", type=int, default=1)
     parser.add_argument("--logging-dir", type=Path)
     parser.add_argument("--logging-steps", type=int, default=10)
     parser.add_argument("--run-name")
@@ -183,6 +185,9 @@ def main(argv: list[str] | None = None) -> None:
         include_num_input_tokens_seen=True,
         report_to="none",
         run_name=args.run_name,
+        save_strategy="steps",
+        save_steps=args.save_steps,
+        save_total_limit=args.save_total_limit,
     )
     trainer = SFTTrainer(
         model=model,

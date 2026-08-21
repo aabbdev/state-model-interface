@@ -790,7 +790,9 @@ uv run smi-train-rwkv7 \
   --output outputs/rwkv7-smi \
   --max-length 2048 \
   --logging-dir /root/tf-logs/rwkv7-smi \
-  --run-name rwkv7-smi
+  --run-name rwkv7-smi \
+  --save-steps 500 \
+  --save-total-limit 1
 ```
 
 For a prepared local mixture, use for example:
@@ -831,6 +833,8 @@ TensorBoard reporting is enabled by default. On GPUHub, point `--logging-dir` at
 Besides TRL's loss, learning rate, gradient norm, entropy, token accuracy and token
 throughput, the training callback records allocated, reserved and peak CUDA memory.
 Use `--report-to none` to disable TensorBoard.
+The default checkpoint policy keeps only the latest resumable checkpoint while the
+final model is written directly in the output directory.
 
 Reasoning fields (`reasoning_content` or `thinking`) are preserved when present.
 The neutral generation boundary lets the model choose THINK, OUT, or ACT. Use

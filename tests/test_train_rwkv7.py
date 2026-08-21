@@ -19,6 +19,8 @@ def test_training_cli_defaults_to_pinned_model_and_tensorboard() -> None:
     assert args.report_to == "tensorboard"
     assert args.logging_dir is None
     assert args.logging_steps == 10
+    assert args.save_steps == 500
+    assert args.save_total_limit == 1
     assert args.no_packing is False
     assert args.no_gradient_checkpointing is False
     assert args.wkv_implementation == "chunked"
