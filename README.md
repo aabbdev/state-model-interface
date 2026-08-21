@@ -812,7 +812,9 @@ The preparation command streams six immutable-revision, commercially usable
 training sources, validates every example with the SMI compiler, deduplicates
 canonical content, enforces assistant-token quotas and `--max-length`, and writes
 a Parquet file plus a `.manifest.json` provenance and rejection report. It never
-reads evaluation splits. Use repeatable `--quota SOURCE=TOKENS` options to make a
+reads evaluation splits. Pathological serialized rows are rejected before tokenization
+at `max_length * 16` characters by default; override this with
+`--max-serialized-chars`. Use repeatable `--quota SOURCE=TOKENS` options to make a
 smaller smoke mixture.
 
 The dataset must contain a `messages` column in Hugging Face conversational format.

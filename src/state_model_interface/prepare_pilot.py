@@ -485,22 +485,6 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _maximum_decoded_token_chars(tokenizer: Any) -> int:
-    maximum = max(
-        len(
-            tokenizer.decode(
-                [token_id],
-                skip_special_tokens=False,
-                clean_up_tokenization_spaces=False,
-            )
-        )
-        for token_id in range(len(tokenizer))
-    )
-    if maximum <= 0:
-        raise ValueError("tokenizer has no non-empty decoded token")
-    return maximum
-
-
 def prepare(
     *,
     output: Path,
@@ -508,6 +492,7 @@ def prepare(
     sources: Sequence[SourceSpec],
     tokenizer: Any,
     max_length: int,
+    max_serialized_chars: int | None = None,
     seed: int,
     shuffle_buffer: int,
     row_group_size: int,
@@ -520,6 +505,10 @@ def prepare(
 
     if max_length <= 0 or row_group_size <= 0 or shuffle_buffer <= 0:
         raise ValueError("length and buffer sizes must be positive")
+    if max_serialized_chars is None:
+        max_serialized_chars = max_length * 16
+    if max_serialized_chars <= 0:
+        raise ValueError("max serialized characters must be positive")
     if output.exists():
         raise FileExistsError(f"refusing to overwrite existing mixture: {output}")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -528,7 +517,6 @@ def prepare(
     if temporary_output.exists():
         raise FileExistsError(f"incomplete mixture already exists: {temporary_output}")
     token_ids = install_smi_tokens(tokenizer)
-    maximum_token_chars = _maximum_decoded_token_chars(tokenizer)
     schema = pa.schema(
         [
             ("messages_json", pa.string()),
@@ -591,7 +579,7 @@ def prepare(
                     canonical_tools = _canonical_json(tools)
                     if (
                         len(canonical_messages) + len(canonical_tools)
-                        > max_length * maximum_token_chars
+                        > max_serialized_chars
                     ):
                         reject(source.name, "oversized_text")
                         continue
@@ -649,6 +637,7 @@ def prepare(
         "tokenizer": TOKENIZER,
         "tokenizer_revision": TOKENIZER_REVISION,
         "max_length": max_length,
+        "max_serialized_chars": max_serialized_chars,
         "seed": seed,
         "shuffle_buffer": shuffle_buffer,
         "total_rows": total_rows,
@@ -673,6 +662,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--max-length", type=int, default=2048)
+    parser.add_argument(
+        "--max-serialized-chars",
+        type=int,
+        help="reject pathological rows before tokenization (default: max-length * 16)",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--shuffle-buffer", type=int, default=10_000)
     parser.add_argument("--row-group-size", type=int, default=1024)
@@ -708,6 +702,7 @@ def main(argv: list[str] | None = None) -> None:
         sources=sources,
         tokenizer=tokenizer,
         max_length=args.max_length,
+        max_serialized_chars=args.max_serialized_chars,
         seed=args.seed,
         shuffle_buffer=args.shuffle_buffer,
         row_group_size=args.row_group_size,

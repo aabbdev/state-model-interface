@@ -14,7 +14,6 @@ from state_model_interface.prepare_pilot import (
     TOKENIZER_REVISION,
     TOTAL_TARGET_TOKENS,
     SourceSpec,
-    _maximum_decoded_token_chars,
     _quota_overrides,
     adapt_aya,
     adapt_hermes,
@@ -44,21 +43,6 @@ class ByteTokenizer:
 
     def convert_tokens_to_ids(self, token: str) -> int:
         return self.vocab.get(token, -1)
-
-    def __len__(self) -> int:
-        return len(self.vocab)
-
-    def decode(
-        self,
-        token_ids: list[int],
-        *,
-        skip_special_tokens: bool,
-        clean_up_tokenization_spaces: bool,
-    ) -> str:
-        assert skip_special_tokens is False
-        assert clean_up_tokenization_spaces is False
-        inverse = {token_id: token for token, token_id in self.vocab.items()}
-        return "".join(inverse[token_id] for token_id in token_ids)
 
     def encode(
         self,
@@ -230,17 +214,12 @@ def test_opencode_requires_high_finite_score() -> None:
 def test_cli_defaults_and_quota_validation() -> None:
     args = parse_args(["--output", "pilot.parquet"])
     assert args.max_length == 2048
+    assert args.max_serialized_chars is None
     assert args.shuffle_buffer == 10_000
     assert args.minimum_code_score == 0.8
     assert _quota_overrides(["aya=12"]) == {"aya": 12}
     with pytest.raises(ValueError):
         _quota_overrides(["unknown=1"])
-
-
-def test_maximum_token_span_is_derived_from_decoding() -> None:
-    tokenizer = ByteTokenizer()
-    tokenizer.vocab["x" * 128] = len(tokenizer.vocab)
-    assert _maximum_decoded_token_chars(tokenizer) == 128
 
 
 def test_prepare_writes_simple_parquet_and_manifest_offline(tmp_path: Path) -> None:
@@ -296,6 +275,7 @@ def test_prepare_writes_simple_parquet_and_manifest_offline(tmp_path: Path) -> N
     assert table["source"].to_pylist() == ["aya"]
     assert manifest["complete"] is True
     assert manifest["target_tokens"] == target_tokens
+    assert manifest["max_serialized_chars"] == 16_000
     assert len(manifest["output_sha256"]) == 64
     assert json.loads(manifest_path.read_text()) == manifest
     with pytest.raises(FileExistsError, match="overwrite"):
