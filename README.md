@@ -788,7 +788,9 @@ uv run smi-train-rwkv7 \
   --dataset OWNER/DATASET \
   --split train \
   --output outputs/rwkv7-smi \
-  --max-length 2048
+  --max-length 2048 \
+  --logging-dir /root/tf-logs/rwkv7-smi \
+  --run-name rwkv7-smi
 ```
 
 The dataset must contain a `messages` column in Hugging Face conversational format.
@@ -802,6 +804,12 @@ Optional columns are `tools`, `smi_ctrl`, `smi_caps`, and
 * uses BFD packing, whose reset `position_ids` become RWKV recurrent boundaries;
 * enables gradient checkpointing and disables the recurrent cache;
 * saves model, tokenizer, template, and `smi_token_ids.json` together.
+
+TensorBoard reporting is enabled by default. On GPUHub, point `--logging-dir` at
+`/root/tf-logs/<run-name>` so the built-in AutoPanel discovers the event files.
+Besides TRL's loss, learning rate, gradient norm, entropy, token accuracy and token
+throughput, the training callback records allocated, reserved and peak CUDA memory.
+Use `--report-to none` to disable TensorBoard.
 
 Reasoning fields (`reasoning_content` or `thinking`) are preserved when present.
 The neutral generation boundary lets the model choose THINK, OUT, or ACT. Use

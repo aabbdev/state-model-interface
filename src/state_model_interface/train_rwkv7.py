@@ -30,6 +30,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=2e-5)
+    parser.add_argument("--logging-dir", type=Path)
+    parser.add_argument("--logging-steps", type=int, default=10)
+    parser.add_argument("--run-name")
+    parser.add_argument(
+        "--report-to", choices=("tensorboard", "none"), default="tensorboard"
+    )
     parser.add_argument("--full-loss", action="store_true")
     parser.add_argument("--no-packing", action="store_true")
     parser.add_argument("--no-gradient-checkpointing", action="store_true")
@@ -43,7 +49,10 @@ def main(argv: list[str] | None = None) -> None:
 
     import torch
     from datasets import load_dataset
+    from torch.utils.tensorboard import SummaryWriter
     from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedConfig
+    from transformers.integrations.integration_utils import TensorBoardCallback
+    from transformers.trainer_callback import TrainerCallback
     from trl.trainer.sft_config import SFTConfig
     from trl.trainer.sft_trainer import SFTTrainer
 
@@ -93,6 +102,44 @@ def main(argv: list[str] | None = None) -> None:
         desc="Compiling SMI token streams",
     )
 
+    logging_dir = args.logging_dir or args.output / "tensorboard"
+
+    class GpuMetricsCallback(TrainerCallback):
+        def __init__(self, writer: SummaryWriter) -> None:
+            self.writer = writer
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            del args, state, control, kwargs
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            del args, control, kwargs
+            if not torch.cuda.is_available():
+                return
+            gib = 1024**3
+            self.writer.add_scalar(
+                "gpu/memory_allocated_gib",
+                torch.cuda.memory_allocated() / gib,
+                state.global_step,
+            )
+            self.writer.add_scalar(
+                "gpu/memory_reserved_gib",
+                torch.cuda.memory_reserved() / gib,
+                state.global_step,
+            )
+            self.writer.add_scalar(
+                "gpu/max_memory_allocated_gib",
+                torch.cuda.max_memory_allocated() / gib,
+                state.global_step,
+            )
+            self.writer.flush()
+
+    callbacks = None
+    if args.report_to == "tensorboard":
+        writer = SummaryWriter(log_dir=str(logging_dir))
+        callbacks = [TensorBoardCallback(tb_writer=writer), GpuMetricsCallback(writer)]
+
     training_args = SFTConfig(
         output_dir=str(args.output),
         num_train_epochs=args.epochs,
@@ -109,13 +156,18 @@ def main(argv: list[str] | None = None) -> None:
         gradient_checkpointing=not args.no_gradient_checkpointing,
         bf16=args.dtype == "bfloat16",
         fp16=False,
+        logging_steps=args.logging_steps,
+        logging_first_step=True,
+        include_num_input_tokens_seen=True,
         report_to="none",
+        run_name=args.run_name,
     )
     trainer = SFTTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset,
         processing_class=tokenizer,
+        callbacks=callbacks,
     )
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     trainer.save_model(args.output)
