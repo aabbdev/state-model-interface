@@ -859,6 +859,10 @@ Use `--report-to none` to disable TensorBoard.
 The default checkpoint policy keeps only the latest resumable checkpoint while the
 final model is written directly in the output directory.
 
+On the documented GPUHub layout, `scripts/launch_gpu_pilot.sh` waits for the pinned
+10M-token mixture manifest, refuses partial data or an existing output, then launches
+the validated BF16 TileLang run with TensorBoard and bounded checkpoint retention.
+
 Reasoning fields (`reasoning_content` or `thinking`) are preserved when present.
 The neutral generation boundary lets the model choose THINK, OUT, or ACT. Use
 `--full-loss` to train runtime-side tokens as well; assistant-only labels are the
