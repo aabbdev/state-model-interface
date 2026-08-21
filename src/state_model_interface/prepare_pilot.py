@@ -19,6 +19,8 @@ from .compiler import compile_smi, install_smi_tokens
 TOKENIZER = "aabbdev/RWKV7-1.5B-20260805"
 TOKENIZER_REVISION = "5904f9d1cdb05a565e5da9304db0447c8a8eb938"
 NEMOTRON_REVISION = "7c804833427f633ccd53b582dbf02525fd680f78"
+OPENR1_REVISION = "e4e141ec9dea9f8326f4d347be56105859b2bd68"
+OPENCODE_REVISION = "8f3ba5bafe4d6e8db46082cf7ae6741bc370604d"
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,7 +35,7 @@ class SourceSpec:
     license: str
     quota: int
     adapter: str
-    data_url: str | None = None
+    data_url: str | tuple[str, ...] | None = None
 
 
 DEFAULT_SOURCES: tuple[SourceSpec, ...] = (
@@ -92,20 +94,30 @@ DEFAULT_SOURCES: tuple[SourceSpec, ...] = (
         "open-r1/OpenR1-Math-220k",
         "default",
         "train",
-        "e4e141ec9dea9f8326f4d347be56105859b2bd68",
+        OPENR1_REVISION,
         "Apache-2.0",
         1_000_000,
         "openr1",
+        tuple(
+            "https://huggingface.co/datasets/open-r1/OpenR1-Math-220k/resolve/"
+            f"{OPENR1_REVISION}/data/train-{index:05d}-of-00010.parquet"
+            for index in range(10)
+        ),
     ),
     SourceSpec(
         "opencodeinstruct",
         "nvidia/OpenCodeInstruct",
         "train",
         "train",
-        "8f3ba5bafe4d6e8db46082cf7ae6741bc370604d",
+        OPENCODE_REVISION,
         "CC-BY-4.0",
         1_500_000,
         "opencode",
+        tuple(
+            "https://huggingface.co/datasets/nvidia/OpenCodeInstruct/resolve/"
+            f"{OPENCODE_REVISION}/data/train-{index:05d}-of-00050.parquet"
+            for index in range(50)
+        ),
     ),
 )
 
@@ -437,10 +449,13 @@ def _source_rows(spec: SourceSpec, *, seed: int, buffer_size: int) -> Iterable:
     from datasets import load_dataset
 
     if spec.data_url:
-        data_format = "parquet" if spec.data_url.endswith(".parquet") else "json"
+        data_urls = (
+            (spec.data_url,) if isinstance(spec.data_url, str) else spec.data_url
+        )
+        data_format = "parquet" if data_urls[0].endswith(".parquet") else "json"
         dataset = load_dataset(
             data_format,
-            data_files={spec.split: spec.data_url},
+            data_files={spec.split: list(data_urls)},
             split=spec.split,
             streaming=True,
         )

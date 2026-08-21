@@ -74,9 +74,17 @@ def test_default_sources_are_pinned_and_quotas_sum_to_ten_million() -> None:
     )
     aya = next(source for source in DEFAULT_SOURCES if source.adapter == "aya")
     hermes = next(source for source in DEFAULT_SOURCES if source.adapter == "hermes")
+    openr1 = next(source for source in DEFAULT_SOURCES if source.adapter == "openr1")
+    opencode = next(
+        source for source in DEFAULT_SOURCES if source.adapter == "opencode"
+    )
     assert nemotron.data_url is not None
-    assert aya.data_url is not None and aya.data_url.endswith(".parquet")
+    assert isinstance(aya.data_url, str) and aya.data_url.endswith(".parquet")
     assert NEMOTRON_REVISION in nemotron.data_url
+    assert isinstance(openr1.data_url, tuple) and len(openr1.data_url) == 10
+    assert isinstance(opencode.data_url, tuple) and len(opencode.data_url) == 50
+    assert all(openr1.revision in url for url in openr1.data_url)
+    assert all(opencode.revision in url for url in opencode.data_url)
     assert nemotron.quota == 2_810_000
     assert hermes.quota == 190_000
     assert TOKENIZER_REVISION == "5904f9d1cdb05a565e5da9304db0447c8a8eb938"
