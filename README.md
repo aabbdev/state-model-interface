@@ -815,8 +815,9 @@ a Parquet file plus a `.manifest.json` provenance and rejection report. It never
 reads evaluation splits. Pathological serialized rows are rejected before tokenization
 at `max_length * 16` characters by default; override this with
 `--max-serialized-chars`. Use repeatable `--quota SOURCE=TOKENS` options to make a
-smaller smoke mixture. Secure SMI compilation uses 16 bounded, order-preserving
-workers by default; tune this with `--workers`.
+smaller smoke mixture. Secure SMI compilation uses one stable worker by default;
+bounded, order-preserving thread parallelism is available with `--workers`, but must
+be validated against the selected tokenizer before production use.
 
 For unreliable or rate-limited Hub access, cache immutable direct shards first:
 

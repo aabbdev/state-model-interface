@@ -230,7 +230,7 @@ def test_cli_defaults_and_quota_validation() -> None:
     assert args.max_length == 2048
     assert args.max_serialized_chars is None
     assert args.shuffle_buffer == 10_000
-    assert args.workers == 16
+    assert args.workers == 1
     assert args.minimum_code_score == 0.8
     assert _quota_overrides(["aya=12"]) == {"aya": 12}
     with pytest.raises(ValueError):

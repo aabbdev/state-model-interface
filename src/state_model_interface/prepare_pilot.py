@@ -852,7 +852,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--shuffle-buffer", type=int, default=10_000)
     parser.add_argument("--row-group-size", type=int, default=1024)
-    parser.add_argument("--workers", type=int, default=16)
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--minimum-code-score", type=float, default=0.8)
     parser.add_argument(
         "--quota",

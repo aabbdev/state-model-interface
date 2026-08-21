@@ -36,7 +36,7 @@ SMI_PILOT_SOURCE_CACHE="$source_cache" nohup smi-prepare-pilot \
     --max-serialized-chars 32768 \
     --shuffle-buffer 10000 \
     --row-group-size 1024 \
-    --workers 16 \
+    --workers 1 \
     >"$data_root/smi-pilot-10m.prepare.log" 2>&1 &
 prepare_pid=$!
 echo "$prepare_pid" >"$prepare_pid_file"
