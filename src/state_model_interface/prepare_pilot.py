@@ -56,6 +56,11 @@ DEFAULT_SOURCES: tuple[SourceSpec, ...] = (
         "Apache-2.0",
         1_000_000,
         "aya",
+        (
+            "https://huggingface.co/datasets/CohereLabs/aya_dataset/resolve/"
+            "f9ea04583f02a8f86404ff6c58bf75fe637df8a2/"
+            "data/train-00000-of-00001.parquet"
+        ),
     ),
     SourceSpec(
         "nemotron_agentic",
@@ -432,8 +437,9 @@ def _source_rows(spec: SourceSpec, *, seed: int, buffer_size: int) -> Iterable:
     from datasets import load_dataset
 
     if spec.data_url:
+        data_format = "parquet" if spec.data_url.endswith(".parquet") else "json"
         dataset = load_dataset(
-            "json",
+            data_format,
             data_files={spec.split: spec.data_url},
             split=spec.split,
             streaming=True,
