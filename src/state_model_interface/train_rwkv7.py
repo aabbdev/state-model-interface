@@ -14,11 +14,22 @@ DEFAULT_MODEL = "aabbdev/RWKV7-1.5B-20260805"
 DEFAULT_REVISION = "5904f9d1cdb05a565e5da9304db0447c8a8eb938"
 
 
+def _json_field(value: Any, name: str) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{name} contains invalid JSON") from error
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Full-fine-tune RWKV7 with SMI")
     parser.add_argument("--dataset", required=True, help="Hugging Face dataset ID")
     parser.add_argument("--dataset-config")
+    parser.add_argument("--data-files", nargs="+")
     parser.add_argument("--split", default="train")
+    parser.add_argument("--dataset-num-proc", type=int, default=8)
     parser.add_argument("--messages-column", default="messages")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--revision", default=DEFAULT_REVISION)
@@ -79,6 +90,7 @@ def main(argv: list[str] | None = None) -> None:
     dataset = load_dataset(
         args.dataset,
         args.dataset_config,
+        data_files=args.data_files,
         split=args.split,
     )
     if args.messages_column not in dataset.column_names:
@@ -86,12 +98,16 @@ def main(argv: list[str] | None = None) -> None:
 
     def compile_row(example: dict[str, Any]) -> dict[str, list[int]]:
         template_kwargs = example.get("chat_template_kwargs") or {}
+        messages = _json_field(example[args.messages_column], args.messages_column)
+        tools = _json_field(example.get("tools", example.get("tools_json")), "tools")
+        smi_ctrl = _json_field(example.get("smi_ctrl"), "smi_ctrl")
+        smi_caps = _json_field(example.get("smi_caps"), "smi_caps")
         compiled = compile_smi(
             tokenizer,
-            example[args.messages_column],
-            tools=example.get("tools"),
-            smi_ctrl=example.get("smi_ctrl"),
-            smi_caps=example.get("smi_caps"),
+            messages,
+            tools=tools,
+            smi_ctrl=smi_ctrl,
+            smi_caps=smi_caps,
             token_ids=token_ids,
             assistant_only_loss=not args.full_loss,
             preserve_thinking=bool(template_kwargs.get("preserve_thinking", True)),
@@ -103,6 +119,7 @@ def main(argv: list[str] | None = None) -> None:
     dataset = dataset.map(
         compile_row,
         remove_columns=dataset.column_names,
+        num_proc=args.dataset_num_proc,
         desc="Compiling SMI token streams",
     )
 
@@ -154,6 +171,7 @@ def main(argv: list[str] | None = None) -> None:
         max_length=args.max_length,
         packing=not args.no_packing,
         packing_strategy="bfd",
+        shuffle_dataset=True,
         assistant_only_loss=False,
         completion_only_loss=False,
         use_cache=False,

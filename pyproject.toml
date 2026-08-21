@@ -19,6 +19,7 @@ train = [
 ]
 
 [project.scripts]
+smi-prepare-pilot = "state_model_interface.prepare_pilot:main"
 smi-train-rwkv7 = "state_model_interface.train_rwkv7:main"
 
 [dependency-groups]

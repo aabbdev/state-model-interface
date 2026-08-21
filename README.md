@@ -793,6 +793,26 @@ uv run smi-train-rwkv7 \
   --run-name rwkv7-smi
 ```
 
+For a prepared local mixture, use for example:
+
+```bash
+uv run smi-prepare-pilot \
+  --output /root/autodl-tmp/data/smi-pilot-10m.parquet
+
+uv run smi-train-rwkv7 \
+  --dataset parquet \
+  --data-files /root/autodl-tmp/data/smi-pilot-10m.parquet \
+  --messages-column messages_json \
+  --output /root/autodl-tmp/runs/rwkv7-smi-pilot
+```
+
+The preparation command streams six immutable-revision, commercially usable
+training sources, validates every example with the SMI compiler, deduplicates
+canonical content, enforces assistant-token quotas and `--max-length`, and writes
+a Parquet file plus a `.manifest.json` provenance and rejection report. It never
+reads evaluation splits. Use repeatable `--quota SOURCE=TOKENS` options to make a
+smaller smoke mixture.
+
 The dataset must contain a `messages` column in Hugging Face conversational format.
 Optional columns are `tools`, `smi_ctrl`, `smi_caps`, and
 `chat_template_kwargs`. The training command:
