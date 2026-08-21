@@ -64,7 +64,7 @@ DEFAULT_SOURCES: tuple[SourceSpec, ...] = (
         "tool_calling",
         NEMOTRON_REVISION,
         "CC-BY-4.0 / Apache-2.0 / MIT",
-        2_000_000,
+        2_810_000,
         "nemotron",
         (
             "https://huggingface.co/datasets/nvidia/"
@@ -79,7 +79,7 @@ DEFAULT_SOURCES: tuple[SourceSpec, ...] = (
         "train",
         "dae3e1d28cfbcf4b915c04ea1e072030529b4bda",
         "Apache-2.0",
-        1_000_000,
+        190_000,
         "hermes",
     ),
     SourceSpec(

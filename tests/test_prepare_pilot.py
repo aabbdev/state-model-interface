@@ -88,8 +88,11 @@ def test_default_sources_are_pinned_and_quotas_sum_to_ten_million() -> None:
     nemotron = next(
         source for source in DEFAULT_SOURCES if source.adapter == "nemotron"
     )
+    hermes = next(source for source in DEFAULT_SOURCES if source.adapter == "hermes")
     assert nemotron.data_url is not None
     assert NEMOTRON_REVISION in nemotron.data_url
+    assert nemotron.quota == 2_810_000
+    assert hermes.quota == 190_000
     assert TOKENIZER_REVISION == "5904f9d1cdb05a565e5da9304db0447c8a8eb938"
     assert all(
         "test" not in source.split and "eval" not in source.split
