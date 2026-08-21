@@ -51,10 +51,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--full-loss", action="store_true")
     parser.add_argument("--no-packing", action="store_true")
-    parser.add_argument("--no-gradient-checkpointing", action="store_true")
-    parser.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
+    parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument(
-        "--wkv-implementation", choices=("chunked", "eager"), default="chunked"
+        "--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16"
+    )
+    parser.add_argument(
+        "--wkv-implementation",
+        choices=("auto", "smi_tilelang", "chunked", "eager"),
+        default="auto",
     )
     parser.add_argument("--resume-from-checkpoint")
     return parser.parse_args(argv)
@@ -72,7 +76,11 @@ def main(argv: list[str] | None = None) -> None:
     from trl.trainer.sft_config import SFTConfig
     from trl.trainer.sft_trainer import SFTTrainer
 
-    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
+    dtype = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }[args.dtype]
     tokenizer = AutoTokenizer.from_pretrained(
         args.model,
         revision=args.revision,
@@ -85,7 +93,23 @@ def main(argv: list[str] | None = None) -> None:
         dtype=dtype,
     )
     model.config.use_cache = False
-    model.config.wkv_implementation = args.wkv_implementation
+    resolved_wkv = args.wkv_implementation
+    if resolved_wkv == "auto":
+        from .rwkv7_tilelang_kernel import tilelang_training_available
+
+        resolved_wkv = (
+            "smi_tilelang"
+            if dtype in {torch.bfloat16, torch.float16}
+            and tilelang_training_available()
+            else "chunked"
+        )
+    use_tilelang = resolved_wkv == "smi_tilelang"
+    if use_tilelang:
+        if dtype not in {torch.bfloat16, torch.float16}:
+            raise ValueError("smi_tilelang requires --dtype bfloat16 or float16")
+        model.config.wkv_implementation = "chunked"
+    else:
+        model.config.wkv_implementation = resolved_wkv
     token_ids = install_smi_tokens(tokenizer, model)
     tokenizer.chat_template = load_chat_template(args.chat_template)
 
@@ -177,9 +201,9 @@ def main(argv: list[str] | None = None) -> None:
         assistant_only_loss=False,
         completion_only_loss=False,
         use_cache=False,
-        gradient_checkpointing=not args.no_gradient_checkpointing,
+        gradient_checkpointing=args.gradient_checkpointing,
         bf16=args.dtype == "bfloat16",
-        fp16=False,
+        fp16=args.dtype == "float16",
         logging_steps=args.logging_steps,
         logging_first_step=True,
         include_num_input_tokens_seen=True,
@@ -196,7 +220,16 @@ def main(argv: list[str] | None = None) -> None:
         processing_class=tokenizer,
         callbacks=callbacks,
     )
-    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+    restore_wkv_backend = None
+    if use_tilelang:
+        from .rwkv7_tilelang_kernel import register_rwkv7_tilelang_kernel
+
+        restore_wkv_backend = register_rwkv7_tilelang_kernel(model)
+    try:
+        trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
+    finally:
+        if restore_wkv_backend is not None:
+            restore_wkv_backend()
     trainer.save_model(args.output)
     tokenizer.save_pretrained(args.output)
     args.output.mkdir(parents=True, exist_ok=True)
@@ -213,7 +246,7 @@ def main(argv: list[str] | None = None) -> None:
             {
                 "base_model": args.model,
                 "base_revision": args.revision,
-                "wkv_implementation": args.wkv_implementation,
+                "wkv_implementation": resolved_wkv,
                 "max_length": args.max_length,
                 "packing": not args.no_packing,
                 "assistant_only_loss": not args.full_loss,

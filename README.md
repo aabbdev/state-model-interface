@@ -823,10 +823,33 @@ Optional columns are `tools`, `smi_ctrl`, `smi_caps`, and
 * installs the SMI tokens and resizes the model;
 * compiles secure `input_ids` and labels before TRL sees the dataset;
 * uses TRL's default `chunked_nll`;
-* selects RWKV's differentiable `chunked` recurrence for sequence training;
+* selects the full DPLR TileLang forward/backward with native varlen boundaries;
 * uses BFD packing, whose reset `position_ids` become RWKV recurrent boundaries;
-* enables gradient checkpointing and disables the recurrent cache;
+* disables the recurrent cache and leaves gradient checkpointing opt-in;
 * saves model, tokenizer, template, and `smi_token_ids.json` together.
+
+The default `--wkv-implementation auto` selects the pinned FLA DPLR TileLang
+implementation on CUDA with BF16/FP16, and otherwise falls back to `chunked`.
+TileLang provides full chunk forward, streaming analytical backward, native
+variable-length boundaries and SM-aware schedules. Load the remote RWKV7 model
+before registering TileLang so FLA's own model registration cannot shadow it; the
+training script restores the global registry before saving.
+
+On an RTX 4080 SUPER (SM89), BF16 inputs with FP32 recurrent state, batch 1 and
+sequence length 2048, the hot TileLang step measured 5.5–5.7k tokens/s with 17.4 GiB
+allocated, versus roughly 537 tokens/s for the portable PyTorch chunked step. Packed
+segment isolation was bit-identical. The TileLang Tensor Core path is not bit-exact
+to the all-FP32 PyTorch reference, so retain `chunked` for numerical audits.
+
+Gradient checkpointing is opt-in (`--gradient-checkpointing`): on the validated
+32 GiB GPU it only adds recomputation overhead, while the TileLang step fits with
+substantial memory headroom.
+
+The accelerated backend is adapted from the MIT-licensed
+[`fla-org/flash-linear-attention`](https://github.com/fla-org/flash-linear-attention)
+DPLR TileLang implementation pinned at commit `27967b970eaa`. The saved model keeps
+`wkv_implementation="chunked"` as a portable reload fallback; `smi_training_config.json`
+records that training used TileLang.
 
 TensorBoard reporting is enabled by default. On GPUHub, point `--logging-dir` at
 `/root/tf-logs/<run-name>` so the built-in AutoPanel discovers the event files.

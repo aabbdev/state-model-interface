@@ -12,6 +12,7 @@ requires-python = ">=3.10"
 [project.optional-dependencies]
 train = [
     "datasets>=5,<6",
+    "flash-linear-attention[tilelang] @ git+https://github.com/fla-org/flash-linear-attention.git@27967b970eaaf982a6960abf6cba8add9c34c7cc ; platform_system == 'Linux'",
     "tensorboard>=2.20,<3",
     "torch>=2.8,<2.9",
     "transformers>=5.15,<6",
@@ -51,3 +52,6 @@ pythonVersion = "3.10"
 
 [tool.hatch.build.targets.wheel.force-include]
 "chat_template.jinja" = "state_model_interface/chat_template.jinja"
+
+[tool.hatch.metadata]
+allow-direct-references = true

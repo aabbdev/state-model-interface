@@ -22,8 +22,20 @@ def test_training_cli_defaults_to_pinned_model_and_tensorboard() -> None:
     assert args.save_steps == 500
     assert args.save_total_limit == 1
     assert args.no_packing is False
-    assert args.no_gradient_checkpointing is False
-    assert args.wkv_implementation == "chunked"
+    assert args.gradient_checkpointing is False
+    assert args.wkv_implementation == "auto"
+
+    tilelang_args = parse_args(
+        [
+            "--dataset",
+            "owner/data",
+            "--output",
+            "run",
+            "--wkv-implementation",
+            "chunked",
+        ]
+    )
+    assert tilelang_args.wkv_implementation == "chunked"
 
 
 def test_json_fields_accept_structures_and_reject_invalid_json() -> None:
