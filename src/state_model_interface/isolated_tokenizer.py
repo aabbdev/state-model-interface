@@ -17,6 +17,7 @@ from .compiler import (
     compile_smi_plans_batched,
     install_smi_tokens,
 )
+from .linear_tokenizer import LinearRWKVTokenizer
 
 TOKENIZER = "aabbdev/RWKV7-1.5B-20260805"
 TOKENIZER_REVISION = "5904f9d1cdb05a565e5da9304db0447c8a8eb938"
@@ -80,6 +81,7 @@ def _default_worker_target(request_queue: Any, response_queue: Any) -> None:
             trust_remote_code=False,
         )
         token_ids = install_smi_tokens(tokenizer)
+        linear_tokenizer = LinearRWKVTokenizer.from_tokenizer(tokenizer)
     except Exception as error:  # noqa: BLE001 - serialize arbitrary worker failures
         response_queue.put(("startup_error", _serialize_error(error)))
         return
@@ -91,7 +93,7 @@ def _default_worker_target(request_queue: Any, response_queue: Any) -> None:
         request_id, plans = request
         try:
             compiled = compile_smi_plans_batched(
-                tokenizer,
+                linear_tokenizer,
                 plans,
                 token_ids=token_ids,
             )
