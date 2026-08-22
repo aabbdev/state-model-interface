@@ -19,7 +19,12 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from .compiler import compile_smi_plan_batched, install_smi_tokens, render_smi_plan
+from .compiler import (
+    compile_smi,
+    compile_smi_plans_batched,
+    install_smi_tokens,
+    render_smi_plan,
+)
 
 TOKENIZER = "aabbdev/RWKV7-1.5B-20260805"
 TOKENIZER_REVISION = "5904f9d1cdb05a565e5da9304db0447c8a8eb938"
@@ -659,29 +664,73 @@ def _prepare_candidate(
         return PreparedCandidate("invalid")
 
 
-def _compile_candidate(
-    candidate: PreparedCandidate,
+def _compile_candidates(
+    candidates: Sequence[PreparedCandidate],
     *,
     tokenizer: Any,
     token_ids: Mapping[str, int],
     max_length: int,
-) -> PreparedPilotRow:
-    try:
-        plan = render_smi_plan(
-            candidate.messages,
-            tools=candidate.tools or None,
-        )
-        compiled = compile_smi_plan_batched(
-            tokenizer,
-            plan,
-            token_ids=token_ids,
-        )
+) -> list[PreparedPilotRow]:
+    results: list[PreparedPilotRow | None] = [None] * len(candidates)
+    plans = []
+    plan_indices = []
+    for index, candidate in enumerate(candidates):
+        try:
+            plans.append(
+                render_smi_plan(
+                    candidate.messages,
+                    tools=candidate.tools or None,
+                )
+            )
+            plan_indices.append(index)
+        except (KeyError, TypeError, ValueError, OverflowError, RecursionError):
+            results[index] = PreparedPilotRow("invalid")
+    compiled_by_index: dict[int, Any] = {}
+
+    def compile_group(indices: list[int], group_plans: list[Any]) -> None:
+        if not group_plans:
+            return
+        try:
+            compiled_group = compile_smi_plans_batched(
+                tokenizer,
+                group_plans,
+                token_ids=token_ids,
+            )
+        except (KeyError, TypeError, ValueError, OverflowError, RecursionError):
+            if len(group_plans) == 1:
+                index = indices[0]
+                candidate = candidates[index]
+                try:
+                    compiled_by_index[index] = compile_smi(
+                        tokenizer,
+                        candidate.messages,
+                        tools=candidate.tools or None,
+                        token_ids=token_ids,
+                    )
+                except (KeyError, TypeError, ValueError, OverflowError, RecursionError):
+                    results[index] = PreparedPilotRow("invalid")
+                return
+            midpoint = len(group_plans) // 2
+            compile_group(indices[:midpoint], group_plans[:midpoint])
+            compile_group(indices[midpoint:], group_plans[midpoint:])
+            return
+        for index, compiled in zip(indices, compiled_group, strict=True):
+            compiled_by_index[index] = compiled
+
+    compile_group(plan_indices, plans)
+    for index in plan_indices:
+        if results[index] is not None:
+            continue
+        compiled = compiled_by_index[index]
+        candidate = candidates[index]
         if len(compiled.input_ids) > max_length:
-            return PreparedPilotRow("too_long")
+            results[index] = PreparedPilotRow("too_long")
+            continue
         target_tokens = sum(label != -100 for label in compiled.labels)
         if target_tokens == 0:
-            return PreparedPilotRow("no_target")
-        return PreparedPilotRow(
+            results[index] = PreparedPilotRow("no_target")
+            continue
+        results[index] = PreparedPilotRow(
             None,
             candidate.fingerprint,
             candidate.messages_json,
@@ -690,8 +739,21 @@ def _compile_candidate(
             tuple(compiled.input_ids),
             tuple(compiled.labels),
         )
-    except (KeyError, TypeError, ValueError, OverflowError, RecursionError):
-        return PreparedPilotRow("invalid")
+    assert all(result is not None for result in results)
+    return [result for result in results if result is not None]
+
+
+def _batched_candidates(
+    candidates: Iterable[PreparedCandidate], batch_size: int
+) -> Iterable[list[PreparedCandidate]]:
+    iterator = iter(candidates)
+    try:
+        while batch := list(itertools.islice(iterator, batch_size)):
+            yield batch
+    finally:
+        close = getattr(iterator, "close", None)
+        if close is not None:
+            close()
 
 
 def _bounded_ordered_map(
@@ -730,6 +792,7 @@ def prepare(
     max_length: int,
     max_serialized_chars: int | None = None,
     workers: int = 1,
+    compile_batch_size: int = 1,
     seed: int,
     shuffle_buffer: int,
     row_group_size: int,
@@ -740,7 +803,13 @@ def prepare(
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    if max_length <= 0 or row_group_size <= 0 or shuffle_buffer <= 0 or workers <= 0:
+    if (
+        max_length <= 0
+        or row_group_size <= 0
+        or shuffle_buffer <= 0
+        or workers <= 0
+        or compile_batch_size <= 0
+    ):
         raise ValueError("length and buffer sizes must be positive")
     if max_serialized_chars is None:
         max_serialized_chars = max_length * 16
@@ -815,52 +884,77 @@ def prepare(
                 )
             )
             source_seen = 0
-            for candidate in prepared_candidates:
-                if stats[source.name]["target_tokens"] >= source.quota:
-                    break
-                source_seen += 1
-                if source_seen % 1_000 == 0:
-                    print(
-                        f"source {source.name}: seen {source_seen}, accepted "
-                        f"{stats[source.name]['rows']} rows / "
-                        f"{stats[source.name]['target_tokens']} tokens",
-                        flush=True,
-                    )
-                if candidate.rejection is not None:
-                    reject(source.name, candidate.rejection)
-                    continue
-                assert candidate.fingerprint is not None
-                if candidate.fingerprint in seen:
-                    reject(source.name, "duplicate")
-                    continue
-                prepared = _compile_candidate(
-                    candidate,
+            quota_reached = False
+            for candidate_batch in _batched_candidates(
+                prepared_candidates, compile_batch_size
+            ):
+                unique_candidates: list[PreparedCandidate] = []
+                batch_fingerprints: set[bytes] = set()
+                for candidate in candidate_batch:
+                    if candidate.rejection is not None:
+                        continue
+                    assert candidate.fingerprint is not None
+                    if (
+                        candidate.fingerprint not in seen
+                        and candidate.fingerprint not in batch_fingerprints
+                    ):
+                        unique_candidates.append(candidate)
+                        batch_fingerprints.add(candidate.fingerprint)
+                compiled = _compile_candidates(
+                    unique_candidates,
                     tokenizer=tokenizer,
                     token_ids=token_ids,
                     max_length=max_length,
                 )
-                if prepared.rejection is not None:
-                    reject(source.name, prepared.rejection)
-                    continue
-                assert prepared.fingerprint is not None
-                assert prepared.messages_json is not None
-                assert prepared.tools_json is not None
-                seen.add(prepared.fingerprint)
-                buffer.append(
-                    {
-                        "messages_json": prepared.messages_json,
-                        "tools_json": prepared.tools_json,
-                        "source": source.name,
-                        "target_tokens": prepared.target_tokens,
-                        "input_ids": list(prepared.input_ids),
-                        "labels": list(prepared.labels),
-                    }
-                )
-                stats[source.name]["target_tokens"] += prepared.target_tokens
-                stats[source.name]["rows"] += 1
-                total_rows += 1
-                if len(buffer) >= row_group_size:
-                    flush()
+                compiled_by_fingerprint = {
+                    candidate.fingerprint: prepared
+                    for candidate, prepared in zip(
+                        unique_candidates, compiled, strict=True
+                    )
+                }
+                for candidate in candidate_batch:
+                    source_seen += 1
+                    if source_seen % 1_000 == 0:
+                        print(
+                            f"source {source.name}: seen {source_seen}, accepted "
+                            f"{stats[source.name]['rows']} rows / "
+                            f"{stats[source.name]['target_tokens']} tokens",
+                            flush=True,
+                        )
+                    if candidate.rejection is not None:
+                        reject(source.name, candidate.rejection)
+                        continue
+                    assert candidate.fingerprint is not None
+                    if candidate.fingerprint in seen:
+                        reject(source.name, "duplicate")
+                        continue
+                    prepared = compiled_by_fingerprint[candidate.fingerprint]
+                    if prepared.rejection is not None:
+                        reject(source.name, prepared.rejection)
+                        continue
+                    assert prepared.messages_json is not None
+                    assert prepared.tools_json is not None
+                    seen.add(candidate.fingerprint)
+                    buffer.append(
+                        {
+                            "messages_json": prepared.messages_json,
+                            "tools_json": prepared.tools_json,
+                            "source": source.name,
+                            "target_tokens": prepared.target_tokens,
+                            "input_ids": list(prepared.input_ids),
+                            "labels": list(prepared.labels),
+                        }
+                    )
+                    stats[source.name]["target_tokens"] += prepared.target_tokens
+                    stats[source.name]["rows"] += 1
+                    total_rows += 1
+                    if len(buffer) >= row_group_size:
+                        flush()
+                    if stats[source.name]["target_tokens"] >= source.quota:
+                        quota_reached = True
+                        break
+                if quota_reached:
+                    break
             close_prepared = getattr(prepared_candidates, "close", None)
             if close_prepared is not None:
                 close_prepared()
@@ -896,6 +990,7 @@ def prepare(
         "max_serialized_chars": max_serialized_chars,
         "source_cache": os.environ.get("SMI_PILOT_SOURCE_CACHE"),
         "workers": workers,
+        "compile_batch_size": compile_batch_size,
         "pretokenized": True,
         "assistant_only_loss": True,
         "preserve_thinking": True,
@@ -932,6 +1027,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--shuffle-buffer", type=int, default=10_000)
     parser.add_argument("--row-group-size", type=int, default=1024)
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--compile-batch-size", type=int, default=128)
     parser.add_argument("--minimum-code-score", type=float, default=0.8)
     parser.add_argument(
         "--quota",
@@ -966,6 +1062,7 @@ def main(argv: list[str] | None = None) -> None:
         max_length=args.max_length,
         max_serialized_chars=args.max_serialized_chars,
         workers=args.workers,
+        compile_batch_size=args.compile_batch_size,
         seed=args.seed,
         shuffle_buffer=args.shuffle_buffer,
         row_group_size=args.row_group_size,

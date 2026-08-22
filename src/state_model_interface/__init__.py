@@ -8,6 +8,7 @@ from .compiler import (
     SMIPlanFragment,
     compile_smi,
     compile_smi_plan_batched,
+    compile_smi_plans_batched,
     install_smi_tokens,
     render_smi_plan,
 )
@@ -21,6 +22,7 @@ __all__ = [
     "SMIPlanFragment",
     "compile_smi",
     "compile_smi_plan_batched",
+    "compile_smi_plans_batched",
     "install_smi_tokens",
     "load_chat_template",
     "render_smi_plan",

@@ -821,7 +821,10 @@ tokenization at `max_length * 16` characters by default; override this with
 `--max-serialized-chars`. Use repeatable `--quota SOURCE=TOKENS` options to make a
 smaller smoke mixture. Secure SMI compilation uses one stable worker by default;
 bounded, order-preserving thread parallelism is available with `--workers`, but must
-be validated against the selected tokenizer before production use.
+be validated against the selected tokenizer before production use. Independently,
+`--compile-batch-size` defaults to 128 and combines plaintext fragments from many
+validated examples into one safe tokenizer batch without sharing a tokenizer across
+threads.
 
 For unreliable or rate-limited Hub access, cache immutable direct shards first:
 

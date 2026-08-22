@@ -7,6 +7,7 @@ from state_model_interface import (
     SMI_TOKENS,
     compile_smi,
     compile_smi_plan_batched,
+    compile_smi_plans_batched,
     install_smi_tokens,
     render_smi_plan,
 )
@@ -250,6 +251,28 @@ def test_batch_compiler_uses_one_call_and_deduplicates_plaintext():
         "truncation": False,
     }
     assert result.input_ids.count(ids["<|sys|>"]) == 0
+
+
+def test_multiple_plans_share_one_batch_call_and_preserve_order():
+    tokenizer = BatchMiniTokenizer()
+    ids = install_smi_tokens(tokenizer)
+    messages = [
+        [{"role": "user", "content": "same"}, {"role": "assistant", "content": "A"}],
+        [{"role": "user", "content": "same"}, {"role": "assistant", "content": "B"}],
+    ]
+    expected = [compile_smi(tokenizer, value, token_ids=ids) for value in messages]
+    plans = [render_smi_plan(value) for value in messages]
+
+    results = compile_smi_plans_batched(tokenizer, plans, token_ids=ids)
+
+    assert [result.input_ids for result in results] == [
+        item.input_ids for item in expected
+    ]
+    assert [result.labels for result in results] == [item.labels for item in expected]
+    assert len(tokenizer.batch_calls) == 1
+    texts, _ = tokenizer.batch_calls[0]
+    assert texts.count("\n") == 1
+    assert texts.count("same") == 1
 
 
 def test_masks_transmission_eot_eos_and_generation_prompt(installed):

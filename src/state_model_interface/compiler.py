@@ -215,6 +215,18 @@ def compile_smi_plan_batched(
     tokenizer. Non-callable lightweight tokenizers fall back to cached scalar
     ``encode`` calls, one per distinct plaintext fragment.
     """
+    return compile_smi_plans_batched(tokenizer, [plan], token_ids=token_ids)[0]
+
+
+def compile_smi_plans_batched(
+    tokenizer: Any,
+    plans: Sequence[SMICompilationPlan],
+    *,
+    token_ids: Mapping[str, int] | None = None,
+) -> list[CompiledSMITraining]:
+    """Compile several validated plans through one tokenizer batch call."""
+    if not plans:
+        return []
     ids = dict(token_ids or _installed_ids(tokenizer))
     if set(ids) != set(SMI_TOKENS):
         raise ValueError("token_ids must map exactly the ten SMI tokens")
@@ -222,16 +234,20 @@ def compile_smi_plan_batched(
     plaintexts = list(
         dict.fromkeys(
             fragment.value
+            for plan in plans
             for fragment in plan.fragments
             if fragment.kind == "plaintext"
         )
     )
     encoded_plaintexts = _batch_encode_plaintexts(tokenizer, plaintexts)
     cache = dict(zip(plaintexts, encoded_plaintexts, strict=True))
-    input_ids, labels, _ = _assemble_plan(
-        tokenizer, plan, ids, cache.__getitem__, include_assistant_mask=False
-    )
-    return CompiledSMITraining(input_ids, labels)
+    results: list[CompiledSMITraining] = []
+    for plan in plans:
+        input_ids, labels, _ = _assemble_plan(
+            tokenizer, plan, ids, cache.__getitem__, include_assistant_mask=False
+        )
+        results.append(CompiledSMITraining(input_ids, labels))
+    return results
 
 
 def _compile_smi_plan_scalar(

@@ -69,6 +69,25 @@ class ByteTokenizer:
         return result
 
 
+class FailingBatchByteTokenizer(ByteTokenizer):
+    def encode(self, text: str, **kwargs: Any) -> list[int]:
+        if text == "bad":
+            raise ValueError("rejected plaintext")
+        return super().encode(text, **kwargs)
+
+    def __call__(self, texts: list[str], **kwargs: Any) -> dict[str, list[list[int]]]:
+        return {
+            "input_ids": [
+                self.encode(
+                    text,
+                    add_special_tokens=kwargs["add_special_tokens"],
+                    split_special_tokens=kwargs["split_special_tokens"],
+                )
+                for text in texts
+            ]
+        }
+
+
 def test_default_sources_are_pinned_and_quotas_sum_to_ten_million() -> None:
     assert TOTAL_TARGET_TOKENS == 10_000_000
     assert sum(source.quota for source in DEFAULT_SOURCES) == 10_000_000
@@ -236,6 +255,7 @@ def test_cli_defaults_and_quota_validation() -> None:
     assert args.max_serialized_chars is None
     assert args.shuffle_buffer == 10_000
     assert args.workers == 1
+    assert args.compile_batch_size == 128
     assert args.minimum_code_score == 0.8
     assert _quota_overrides(["aya=12"]) == {"aya": 12}
     with pytest.raises(ValueError):
@@ -403,6 +423,7 @@ def test_prepare_writes_simple_parquet_and_manifest_offline(tmp_path: Path) -> N
     assert manifest["pretokenized"] is True
     assert manifest["max_serialized_chars"] == 16_000
     assert manifest["workers"] == 1
+    assert manifest["compile_batch_size"] == 1
     assert len(manifest["output_sha256"]) == 64
     assert json.loads(manifest_path.read_text()) == manifest
     with pytest.raises(FileExistsError, match="overwrite"):
@@ -431,10 +452,12 @@ def test_prepare_writes_simple_parquet_and_manifest_offline(tmp_path: Path) -> N
         row_group_size=1,
         minimum_code_score=0.8,
         workers=4,
+        compile_batch_size=4,
         row_provider=rows,
     )
     assert pq.read_table(parallel_output).to_pylist() == table.to_pylist()
     assert parallel_manifest["workers"] == 4
+    assert parallel_manifest["compile_batch_size"] == 4
 
 
 def test_prepare_rejects_oversized_text_before_tokenization(tmp_path: Path) -> None:
@@ -465,3 +488,39 @@ def test_prepare_rejects_oversized_text_before_tokenization(tmp_path: Path) -> N
 
     assert manifest["total_rows"] == 0
     assert manifest["sources"][0]["rejected"] == {"oversized_text": 1}
+
+
+def test_microbatch_isolates_one_tokenizer_failure(tmp_path: Path) -> None:
+    tokenizer = FailingBatchByteTokenizer()
+    token_ids = install_smi_tokens(tokenizer)
+    from state_model_interface.compiler import compile_smi
+
+    good = {"inputs": "Q", "targets": "good"}
+    messages, _ = adapt_aya(good)
+    quota = sum(
+        label != -100
+        for label in compile_smi(tokenizer, messages, token_ids=token_ids).labels
+    )
+    source = SourceSpec(
+        "aya", "offline/aya", "default", "train", "a" * 40, "MIT", quota, "aya"
+    )
+    manifest = prepare(
+        output=tmp_path / "pilot.parquet",
+        manifest_path=tmp_path / "manifest.json",
+        sources=[source],
+        tokenizer=tokenizer,
+        max_length=1000,
+        seed=7,
+        shuffle_buffer=8,
+        row_group_size=2,
+        minimum_code_score=0.8,
+        compile_batch_size=2,
+        row_provider=lambda *args, **kwargs: [
+            {"inputs": "Q", "targets": "bad"},
+            good,
+        ],
+    )
+
+    assert manifest["complete"] is True
+    assert manifest["total_rows"] == 1
+    assert manifest["sources"][0]["rejected"] == {"invalid": 1}
