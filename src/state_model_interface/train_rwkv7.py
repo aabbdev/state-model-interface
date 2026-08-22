@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -23,11 +25,86 @@ def _json_field(value: Any, name: str) -> Any:
         raise ValueError(f"{name} contains invalid JSON") from error
 
 
+def _validate_precompiled_row(
+    example: Mapping[str, Any],
+    *,
+    vocab_size: int,
+    max_length: int,
+    full_loss: bool,
+) -> dict[str, list[int]]:
+    input_ids = example.get("input_ids")
+    labels = example.get("labels")
+    if (
+        isinstance(input_ids, (str, bytes))
+        or not isinstance(input_ids, Sequence)
+        or isinstance(labels, (str, bytes))
+        or not isinstance(labels, Sequence)
+    ):
+        raise TypeError("precompiled input_ids and labels must be sequences")
+    if any(
+        not isinstance(token_id, int) or isinstance(token_id, bool)
+        for token_id in input_ids
+    ):
+        raise TypeError("precompiled input_ids must contain integers")
+    if any(not isinstance(label, int) or isinstance(label, bool) for label in labels):
+        raise TypeError("precompiled labels must contain integers")
+    ids = list(input_ids)
+    targets = list(labels)
+    if not ids or len(ids) != len(targets) or len(ids) > max_length:
+        raise ValueError("precompiled token streams have invalid lengths")
+    if any(token_id < 0 or token_id >= vocab_size for token_id in ids):
+        raise ValueError("precompiled input_ids contain an out-of-range token")
+    if any(
+        label != -100 and label != token_id for token_id, label in zip(ids, targets)
+    ):
+        raise ValueError("precompiled labels are not aligned with input_ids")
+    if full_loss:
+        targets = ids.copy()
+    elif all(label == -100 for label in targets):
+        raise ValueError("precompiled example has no model-side target tokens")
+    return {"input_ids": ids, "labels": targets}
+
+
+def _validate_precompiled_manifest(
+    data_files: Sequence[str] | None,
+    *,
+    model: str,
+    revision: str,
+    manifest_path: Path | None = None,
+) -> dict[str, Any]:
+    if data_files is None or len(data_files) != 1:
+        raise ValueError("precompiled SMI data requires exactly one local Parquet file")
+    data_path = Path(data_files[0])
+    manifest_path = manifest_path or Path(f"{data_path}.manifest.json")
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"missing precompiled SMI manifest: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (
+        not manifest.get("complete")
+        or not manifest.get("pretokenized")
+        or manifest.get("format_version") != 2
+        or manifest.get("assistant_only_loss") is not True
+        or manifest.get("preserve_thinking") is not True
+        or not {"input_ids", "labels"}.issubset(manifest.get("columns", []))
+        or manifest.get("tokenizer") != model
+        or manifest.get("tokenizer_revision") != revision
+    ):
+        raise ValueError("precompiled SMI manifest is incomplete or incompatible")
+    digest = hashlib.sha256()
+    with data_path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if manifest.get("output_sha256") != digest.hexdigest():
+        raise ValueError("precompiled SMI Parquet checksum does not match its manifest")
+    return manifest
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Full-fine-tune RWKV7 with SMI")
     parser.add_argument("--dataset", required=True, help="Hugging Face dataset ID")
     parser.add_argument("--dataset-config")
     parser.add_argument("--data-files", nargs="+")
+    parser.add_argument("--precompiled-manifest", type=Path)
     parser.add_argument("--split", default="train")
     parser.add_argument("--dataset-num-proc", type=int, default=8)
     parser.add_argument("--messages-column", default="messages")
@@ -119,7 +196,8 @@ def main(argv: list[str] | None = None) -> None:
         data_files=args.data_files,
         split=args.split,
     )
-    if args.messages_column not in dataset.column_names:
+    is_precompiled = {"input_ids", "labels"}.issubset(dataset.column_names)
+    if not is_precompiled and args.messages_column not in dataset.column_names:
         raise KeyError(f"dataset has no {args.messages_column!r} column")
 
     def compile_row(example: dict[str, Any]) -> dict[str, list[int]]:
@@ -142,12 +220,31 @@ def main(argv: list[str] | None = None) -> None:
             raise ValueError("training example contains no model-side target tokens")
         return {"input_ids": compiled.input_ids, "labels": compiled.labels}
 
-    dataset = dataset.map(
-        compile_row,
-        remove_columns=dataset.column_names,
-        num_proc=args.dataset_num_proc,
-        desc="Compiling SMI token streams",
-    )
+    if is_precompiled:
+        _validate_precompiled_manifest(
+            args.data_files,
+            model=args.model,
+            revision=args.revision,
+            manifest_path=args.precompiled_manifest,
+        )
+        dataset = dataset.map(
+            lambda example: _validate_precompiled_row(
+                example,
+                vocab_size=len(tokenizer),
+                max_length=args.max_length,
+                full_loss=args.full_loss,
+            ),
+            remove_columns=dataset.column_names,
+            num_proc=args.dataset_num_proc,
+            desc="Validating precompiled SMI token streams",
+        )
+    else:
+        dataset = dataset.map(
+            compile_row,
+            remove_columns=dataset.column_names,
+            num_proc=args.dataset_num_proc,
+            desc="Compiling SMI token streams",
+        )
 
     logging_dir = args.logging_dir or args.output / "tensorboard"
 
@@ -263,4 +360,11 @@ if __name__ == "__main__":
     main()
 
 
-__all__ = ["DEFAULT_MODEL", "DEFAULT_REVISION", "main", "parse_args"]
+__all__ = [
+    "DEFAULT_MODEL",
+    "DEFAULT_REVISION",
+    "_validate_precompiled_manifest",
+    "_validate_precompiled_row",
+    "main",
+    "parse_args",
+]

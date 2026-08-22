@@ -19,7 +19,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from .compiler import compile_smi, install_smi_tokens
+from .compiler import compile_smi_plan_batched, install_smi_tokens, render_smi_plan
 
 TOKENIZER = "aabbdev/RWKV7-1.5B-20260805"
 TOKENIZER_REVISION = "5904f9d1cdb05a565e5da9304db0447c8a8eb938"
@@ -42,6 +42,7 @@ class SourceSpec:
     quota: int
     adapter: str
     data_url: str | tuple[str, ...] | None = None
+    columns: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +52,18 @@ class PreparedPilotRow:
     messages_json: str | None = None
     tools_json: str | None = None
     target_tokens: int = 0
+    input_ids: tuple[int, ...] = ()
+    labels: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedCandidate:
+    rejection: str | None
+    fingerprint: bytes | None = None
+    messages: tuple[Mapping[str, Any], ...] = ()
+    tools: tuple[Mapping[str, Any], ...] = ()
+    messages_json: str | None = None
+    tools_json: str | None = None
 
 
 DEFAULT_SOURCES: tuple[SourceSpec, ...] = (
@@ -78,6 +91,7 @@ DEFAULT_SOURCES: tuple[SourceSpec, ...] = (
             "f9ea04583f02a8f86404ff6c58bf75fe637df8a2/"
             "data/train-00000-of-00001.parquet"
         ),
+        ("inputs", "targets"),
     ),
     SourceSpec(
         "nemotron_agentic",
@@ -118,6 +132,14 @@ DEFAULT_SOURCES: tuple[SourceSpec, ...] = (
             f"{OPENR1_REVISION}/data/train-{index:05d}-of-00010.parquet"
             for index in range(10)
         ),
+        (
+            "problem",
+            "generations",
+            "is_reasoning_complete",
+            "correctness_math_verify",
+            "correctness_llama",
+            "answer",
+        ),
     ),
     SourceSpec(
         "opencodeinstruct",
@@ -133,6 +155,7 @@ DEFAULT_SOURCES: tuple[SourceSpec, ...] = (
             f"{OPENCODE_REVISION}/data/train-{index:05d}-of-00050.parquet"
             for index in range(50)
         ),
+        ("average_test_score", "input", "output"),
     ),
 )
 
@@ -477,7 +500,7 @@ def _buffered_shuffle(rows: Iterable, *, seed: int, buffer_size: int) -> Iterabl
     yield from buffer
 
 
-def _single_url_rows(url: str) -> Iterable:
+def _single_url_rows(url: str, columns: Sequence[str] | None = None) -> Iterable:
     import fsspec
     import pyarrow.parquet as pq
 
@@ -492,7 +515,7 @@ def _single_url_rows(url: str) -> Iterable:
             url, "rb", block_size=8 * 1024 * 1024, cache_type="readahead"
         ) as stream:
             parquet = pq.ParquetFile(stream)
-            for batch in parquet.iter_batches(batch_size=256):
+            for batch in parquet.iter_batches(batch_size=1024, columns=columns):
                 yield from batch.to_pylist()
     else:
         with fsspec.open(
@@ -513,12 +536,14 @@ def _cached_url_path(url: str, cache_root: Path) -> Path:
     return cache_root / f"{digest}{suffix}"
 
 
-def _direct_rows(urls: Sequence[str], *, seed: int) -> Iterable:
+def _direct_rows(
+    urls: Sequence[str], *, seed: int, columns: Sequence[str] | None = None
+) -> Iterable:
     ordered_urls = list(urls)
     random.Random(seed).shuffle(ordered_urls)
     pending = iter(ordered_urls)
     active = [
-        iter(_single_url_rows(url))
+        iter(_single_url_rows(url, columns))
         for url in itertools.islice(pending, MAX_OPEN_DIRECT_SHARDS)
     ]
     try:
@@ -531,7 +556,7 @@ def _direct_rows(urls: Sequence[str], *, seed: int) -> Iterable:
                 except StopIteration:
                     replacement = next(pending, None)
                     if replacement is not None:
-                        next_active.append(iter(_single_url_rows(replacement)))
+                        next_active.append(iter(_single_url_rows(replacement, columns)))
             active = next_active
     finally:
         for iterator in active:
@@ -546,7 +571,9 @@ def _source_rows(spec: SourceSpec, *, seed: int, buffer_size: int) -> Iterable:
             (spec.data_url,) if isinstance(spec.data_url, str) else spec.data_url
         )
         return _buffered_shuffle(
-            _direct_rows(data_urls, seed=seed), seed=seed, buffer_size=buffer_size
+            _direct_rows(data_urls, seed=seed, columns=spec.columns),
+            seed=seed,
+            buffer_size=buffer_size,
         )
     from datasets import load_dataset
 
@@ -588,6 +615,16 @@ def _digest(messages: Any, tools: Any) -> bytes:
     return hashlib.sha256(value.encode("utf-8")).digest()
 
 
+def _digest_canonical(messages_json: str, tools_json: str) -> bytes:
+    digest = hashlib.sha256()
+    digest.update(b'{"messages":')
+    digest.update(messages_json.encode("utf-8"))
+    digest.update(b',"tools":')
+    digest.update(tools_json.encode("utf-8"))
+    digest.update(b"}")
+    return digest.digest()
+
+
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -596,15 +633,12 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _prepare_row(
+def _prepare_candidate(
     row: Any,
     *,
     adapter: Adapter,
-    tokenizer: Any,
-    token_ids: Mapping[str, int],
-    max_length: int,
     max_serialized_chars: int,
-) -> PreparedPilotRow:
+) -> PreparedCandidate:
     try:
         if not isinstance(row, Mapping):
             raise TypeError("row is not an object")
@@ -612,12 +646,34 @@ def _prepare_row(
         canonical_messages = _canonical_json(messages)
         canonical_tools = _canonical_json(tools)
         if len(canonical_messages) + len(canonical_tools) > max_serialized_chars:
-            return PreparedPilotRow("oversized_text")
-        fingerprint = _digest(messages, tools)
-        compiled = compile_smi(
+            return PreparedCandidate("oversized_text")
+        return PreparedCandidate(
+            None,
+            _digest_canonical(canonical_messages, canonical_tools),
+            tuple(messages),
+            tuple(tools),
+            canonical_messages,
+            canonical_tools,
+        )
+    except (KeyError, TypeError, ValueError, OverflowError, RecursionError):
+        return PreparedCandidate("invalid")
+
+
+def _compile_candidate(
+    candidate: PreparedCandidate,
+    *,
+    tokenizer: Any,
+    token_ids: Mapping[str, int],
+    max_length: int,
+) -> PreparedPilotRow:
+    try:
+        plan = render_smi_plan(
+            candidate.messages,
+            tools=candidate.tools or None,
+        )
+        compiled = compile_smi_plan_batched(
             tokenizer,
-            messages,
-            tools=tools or None,
+            plan,
             token_ids=token_ids,
         )
         if len(compiled.input_ids) > max_length:
@@ -627,24 +683,26 @@ def _prepare_row(
             return PreparedPilotRow("no_target")
         return PreparedPilotRow(
             None,
-            fingerprint,
-            canonical_messages,
-            canonical_tools,
+            candidate.fingerprint,
+            candidate.messages_json,
+            candidate.tools_json,
             target_tokens,
+            tuple(compiled.input_ids),
+            tuple(compiled.labels),
         )
-    except (KeyError, TypeError, ValueError, OverflowError):
+    except (KeyError, TypeError, ValueError, OverflowError, RecursionError):
         return PreparedPilotRow("invalid")
 
 
 def _bounded_ordered_map(
-    function: Callable[[Any], PreparedPilotRow],
+    function: Callable[[Any], PreparedCandidate],
     rows: Iterable,
     executor: ThreadPoolExecutor,
     *,
     prefetch: int,
-) -> Iterable[PreparedPilotRow]:
+) -> Iterable[PreparedCandidate]:
     iterator = iter(rows)
-    pending: deque[Future[PreparedPilotRow]] = deque()
+    pending: deque[Future[PreparedCandidate]] = deque()
     for row in itertools.islice(iterator, prefetch):
         pending.append(executor.submit(function, row))
     try:
@@ -702,6 +760,8 @@ def prepare(
             ("tools_json", pa.string()),
             ("source", pa.string()),
             ("target_tokens", pa.int64()),
+            ("input_ids", pa.list_(pa.int32())),
+            ("labels", pa.list_(pa.int32())),
         ]
     )
     stats = {
@@ -739,26 +799,23 @@ def prepare(
             rows = row_provider(
                 source, seed=seed + source_index, buffer_size=shuffle_buffer
             )
-            prepare_row = partial(
-                _prepare_row,
+            prepare_candidate = partial(
+                _prepare_candidate,
                 adapter=adapter,
-                tokenizer=tokenizer,
-                token_ids=token_ids,
-                max_length=max_length,
                 max_serialized_chars=max_serialized_chars,
             )
-            prepared_rows = (
-                map(prepare_row, rows)
+            prepared_candidates = (
+                map(prepare_candidate, rows)
                 if executor is None
                 else _bounded_ordered_map(
-                    prepare_row,
+                    prepare_candidate,
                     rows,
                     executor,
                     prefetch=workers * 4,
                 )
             )
             source_seen = 0
-            for prepared in prepared_rows:
+            for candidate in prepared_candidates:
                 if stats[source.name]["target_tokens"] >= source.quota:
                     break
                 source_seen += 1
@@ -769,15 +826,25 @@ def prepare(
                         f"{stats[source.name]['target_tokens']} tokens",
                         flush=True,
                     )
+                if candidate.rejection is not None:
+                    reject(source.name, candidate.rejection)
+                    continue
+                assert candidate.fingerprint is not None
+                if candidate.fingerprint in seen:
+                    reject(source.name, "duplicate")
+                    continue
+                prepared = _compile_candidate(
+                    candidate,
+                    tokenizer=tokenizer,
+                    token_ids=token_ids,
+                    max_length=max_length,
+                )
                 if prepared.rejection is not None:
                     reject(source.name, prepared.rejection)
                     continue
                 assert prepared.fingerprint is not None
                 assert prepared.messages_json is not None
                 assert prepared.tools_json is not None
-                if prepared.fingerprint in seen:
-                    reject(source.name, "duplicate")
-                    continue
                 seen.add(prepared.fingerprint)
                 buffer.append(
                     {
@@ -785,6 +852,8 @@ def prepare(
                         "tools_json": prepared.tools_json,
                         "source": source.name,
                         "target_tokens": prepared.target_tokens,
+                        "input_ids": list(prepared.input_ids),
+                        "labels": list(prepared.labels),
                     }
                 )
                 stats[source.name]["target_tokens"] += prepared.target_tokens
@@ -792,7 +861,7 @@ def prepare(
                 total_rows += 1
                 if len(buffer) >= row_group_size:
                     flush()
-            close_prepared = getattr(prepared_rows, "close", None)
+            close_prepared = getattr(prepared_candidates, "close", None)
             if close_prepared is not None:
                 close_prepared()
             print(
@@ -810,16 +879,26 @@ def prepare(
     temporary_output.rename(output)
     total_tokens = sum(value["target_tokens"] for value in stats.values())
     manifest = {
-        "format_version": 1,
+        "format_version": 2,
         "output": str(output),
         "output_sha256": _file_sha256(output),
-        "columns": ["messages_json", "tools_json", "source", "target_tokens"],
+        "columns": [
+            "messages_json",
+            "tools_json",
+            "source",
+            "target_tokens",
+            "input_ids",
+            "labels",
+        ],
         "tokenizer": TOKENIZER,
         "tokenizer_revision": TOKENIZER_REVISION,
         "max_length": max_length,
         "max_serialized_chars": max_serialized_chars,
         "source_cache": os.environ.get("SMI_PILOT_SOURCE_CACHE"),
         "workers": workers,
+        "pretokenized": True,
+        "assistant_only_loss": True,
+        "preserve_thinking": True,
         "seed": seed,
         "shuffle_buffer": shuffle_buffer,
         "total_rows": total_rows,

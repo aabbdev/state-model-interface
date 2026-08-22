@@ -811,9 +811,13 @@ uv run smi-train-rwkv7 \
 The preparation command streams six immutable-revision, commercially usable
 training sources, validates every example with the SMI compiler, deduplicates
 canonical content, enforces assistant-token quotas and `--max-length`, and writes
-a Parquet file plus a `.manifest.json` provenance and rejection report. It never
-reads evaluation splits. Pathological serialized rows are rejected before tokenization
-at `max_length * 16` characters by default; override this with
+a Parquet file plus a `.manifest.json` provenance and rejection report. Format 2
+stores pinned `input_ids` and assistant-only `labels` beside the canonical JSON, so
+the trainer validates and packs them directly instead of tokenizing the corpus twice.
+For a manifest written outside the default sidecar path, pass
+`--precompiled-manifest /path/to/manifest.json` to `smi-train-rwkv7`.
+It never reads evaluation splits. Pathological serialized rows are rejected before
+tokenization at `max_length * 16` characters by default; override this with
 `--max-serialized-chars`. Use repeatable `--quota SOURCE=TOKENS` options to make a
 smaller smoke mixture. Secure SMI compilation uses one stable worker by default;
 bounded, order-preserving thread parallelism is available with `--workers`, but must

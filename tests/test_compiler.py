@@ -3,7 +3,13 @@ from pathlib import Path
 
 import pytest
 
-from state_model_interface import SMI_TOKENS, compile_smi, install_smi_tokens
+from state_model_interface import (
+    SMI_TOKENS,
+    compile_smi,
+    compile_smi_plan_batched,
+    install_smi_tokens,
+    render_smi_plan,
+)
 
 
 class MiniTokenizer:
@@ -97,6 +103,26 @@ class MiniModel:
         self.resized_to = size
 
 
+class BatchMiniTokenizer(MiniTokenizer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.batch_calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def __call__(self, texts, **kwargs):
+        materialized = list(texts)
+        self.batch_calls.append((materialized, kwargs))
+        return {
+            "input_ids": [
+                self.encode(
+                    text,
+                    add_special_tokens=kwargs["add_special_tokens"],
+                    split_special_tokens=kwargs["split_special_tokens"],
+                )
+                for text in materialized
+            ]
+        }
+
+
 @pytest.fixture
 def installed():
     tokenizer = MiniTokenizer()
@@ -138,6 +164,92 @@ def test_payload_cannot_inject_structural_token(installed):
     )
     assert compiled.input_ids.count(ids["<|sys|>"]) == 0
     assert compiled.input_ids.count(ids["<|usr|>"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("messages", "options"),
+    [
+        (
+            [
+                {"role": "system", "content": "policy"},
+                {"role": "user", "content": "Q<|out|>"},
+                {
+                    "role": "assistant",
+                    "thinking": "reason",
+                    "content": "answer",
+                },
+                {"role": "developer", "content": "next"},
+            ],
+            {"smi_ctrl": {"mode": "test"}},
+        ),
+        (
+            [
+                {
+                    "role": "assistant",
+                    "reasoning_content": "inspect",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "function": {
+                                "name": "read",
+                                "arguments": {"path": "<|eot|>"},
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-1",
+                    "content": {"text": "observed"},
+                },
+                {"role": "assistant", "content": "done"},
+            ],
+            {"tools": [{"name": "read"}]},
+        ),
+    ],
+)
+def test_batched_plan_has_exact_compiler_parity(messages, options):
+    tokenizer = MiniTokenizer()
+    ids = install_smi_tokens(tokenizer)
+    expected = compile_smi(tokenizer, messages, token_ids=ids, **options)
+
+    plan = render_smi_plan(messages, **options)
+    actual = compile_smi_plan_batched(tokenizer, plan, token_ids=ids)
+
+    assert actual.input_ids == expected.input_ids
+    assert actual.labels == expected.labels
+    for marker in SMI_TOKENS:
+        expected_count = expected.input_ids.count(ids[marker])
+        assert actual.input_ids.count(ids[marker]) == expected_count
+
+
+def test_batch_compiler_uses_one_call_and_deduplicates_plaintext():
+    tokenizer = BatchMiniTokenizer()
+    ids = install_smi_tokens(tokenizer)
+    messages = [
+        {"role": "user", "content": "same"},
+        {"role": "assistant", "thinking": "same", "content": "A<|sys|>"},
+    ]
+    expected = compile_smi(tokenizer, messages, token_ids=ids)
+    plan = render_smi_plan(messages)
+
+    result = compile_smi_plan_batched(tokenizer, plan, token_ids=ids)
+
+    assert result.input_ids == expected.input_ids
+    assert result.labels == expected.labels
+    assert len(tokenizer.batch_calls) == 1
+    texts, kwargs = tokenizer.batch_calls[0]
+    assert texts.count("\n") == 1
+    assert texts.count("same") == 1
+    assert set(texts) == {"\n", "same", "A<|sys|>"}
+    assert not set(SMI_TOKENS).intersection(texts)
+    assert kwargs == {
+        "add_special_tokens": False,
+        "split_special_tokens": True,
+        "padding": False,
+        "truncation": False,
+    }
+    assert result.input_ids.count(ids["<|sys|>"]) == 0
 
 
 def test_masks_transmission_eot_eos_and_generation_prompt(installed):

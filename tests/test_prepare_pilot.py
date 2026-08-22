@@ -17,6 +17,8 @@ from state_model_interface.prepare_pilot import (
     TOTAL_TARGET_TOKENS,
     SourceSpec,
     _cached_url_path,
+    _digest,
+    _digest_canonical,
     _quota_overrides,
     _source_rows,
     adapt_aya,
@@ -84,9 +86,12 @@ def test_default_sources_are_pinned_and_quotas_sum_to_ten_million() -> None:
     )
     assert nemotron.data_url is not None
     assert isinstance(aya.data_url, str) and aya.data_url.endswith(".parquet")
+    assert aya.columns == ("inputs", "targets")
     assert NEMOTRON_REVISION in nemotron.data_url
     assert isinstance(openr1.data_url, tuple) and len(openr1.data_url) == 10
     assert isinstance(opencode.data_url, tuple) and len(opencode.data_url) == 50
+    assert openr1.columns is not None and "generations" in openr1.columns
+    assert opencode.columns == ("average_test_score", "input", "output")
     assert all(openr1.revision in url for url in openr1.data_url)
     assert all(opencode.revision in url for url in opencode.data_url)
     assert nemotron.quota == 2_810_000
@@ -237,6 +242,15 @@ def test_cli_defaults_and_quota_validation() -> None:
         _quota_overrides(["unknown=1"])
 
 
+def test_canonical_digest_reuses_exact_serialized_fragments() -> None:
+    messages = [{"role": "assistant", "content": "é"}]
+    tools = [{"b": 2, "a": 1}]
+    assert _digest_canonical(
+        json.dumps(messages, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+        json.dumps(tools, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+    ) == _digest(messages, tools)
+
+
 def test_direct_jsonl_rows_are_streamed_and_shuffled(tmp_path: Path) -> None:
     source_path = tmp_path / "rows.jsonl"
     source_path.write_text("\n".join(json.dumps({"value": i}) for i in range(5)))
@@ -375,11 +389,18 @@ def test_prepare_writes_simple_parquet_and_manifest_offline(tmp_path: Path) -> N
         "tools_json",
         "source",
         "target_tokens",
+        "input_ids",
+        "labels",
     ]
     assert table.num_rows == 1
     assert table["source"].to_pylist() == ["aya"]
+    compiled_row = table.to_pylist()[0]
+    assert len(compiled_row["input_ids"]) == len(compiled_row["labels"])
+    assert sum(label != -100 for label in compiled_row["labels"]) == target_tokens
     assert manifest["complete"] is True
     assert manifest["target_tokens"] == target_tokens
+    assert manifest["format_version"] == 2
+    assert manifest["pretokenized"] is True
     assert manifest["max_serialized_chars"] == 16_000
     assert manifest["workers"] == 1
     assert len(manifest["output_sha256"]) == 64

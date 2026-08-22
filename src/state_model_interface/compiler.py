@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 SMI_TOKENS: tuple[str, ...] = (
     "<|ctrl|>",
@@ -38,6 +38,33 @@ class CompiledSMI:
     input_ids: list[int]
     labels: list[int]
     assistant_mask: list[int]
+
+
+@dataclass(frozen=True, slots=True)
+class SMIPlanFragment:
+    """One independently tokenized plaintext or directly inserted SMI marker."""
+
+    kind: Literal["plaintext", "structural"]
+    value: str
+    assistant: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SMICompilationPlan:
+    """Validated, rendered SMI structure that has not yet been tokenized."""
+
+    fragments: tuple[SMIPlanFragment, ...]
+    append_eos: bool
+    eos_is_assistant: bool
+    assistant_only_loss: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CompiledSMITraining:
+    """Model inputs and labels produced without retaining an assistant mask."""
+
+    input_ids: list[int]
+    labels: list[int]
 
 
 def install_smi_tokens(tokenizer: Any, model: Any | None = None) -> dict[str, int]:
@@ -75,23 +102,42 @@ def compile_smi(
     ids = dict(token_ids or _installed_ids(tokenizer))
     if set(ids) != set(SMI_TOKENS):
         raise ValueError("token_ids must map exactly the ten SMI tokens")
+    plan = render_smi_plan(
+        messages,
+        tools=tools,
+        smi_ctrl=smi_ctrl,
+        smi_caps=smi_caps,
+        assistant_only_loss=assistant_only_loss,
+        add_generation_prompt=add_generation_prompt,
+        preserve_thinking=preserve_thinking,
+    )
+    return _compile_smi_plan_scalar(tokenizer, plan, ids)
+
+
+def render_smi_plan(
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    tools: Sequence[Mapping[str, Any]] | None = None,
+    smi_ctrl: Any | None = None,
+    smi_caps: Any | None = None,
+    assistant_only_loss: bool = True,
+    add_generation_prompt: bool = False,
+    preserve_thinking: bool = True,
+) -> SMICompilationPlan:
+    """Validate and render an SMI conversation without invoking a tokenizer."""
     if tools is not None and (isinstance(tools, (str, bytes, Mapping))):
         raise TypeError("tools must be a sequence of mappings")
     if tools and smi_caps is not None:
         raise ValueError("pass either tools or smi_caps, not both")
     allowed_tool_names = _declared_tool_names(tools, smi_caps)
 
-    input_ids: list[int] = []
-    assistant_mask: list[int] = []
+    fragments: list[SMIPlanFragment] = []
 
     def append_structural(token: str, assistant: bool) -> None:
-        input_ids.append(ids[token])
-        assistant_mask.append(int(assistant))
+        fragments.append(SMIPlanFragment("structural", token, assistant))
 
     def append_plain(value: str, assistant: bool) -> None:
-        encoded = _encode(tokenizer, value, split_special_tokens=True)
-        input_ids.extend(encoded)
-        assistant_mask.extend([int(assistant)] * len(encoded))
+        fragments.append(SMIPlanFragment("plaintext", value, assistant))
 
     def block(token: str, payload: str, assistant: bool) -> None:
         append_structural(token, assistant)
@@ -149,17 +195,122 @@ def compile_smi(
         if side is not None:
             append_structural("<|eot|>", side == "model")
             append_plain("\n", side == "model")
+    return SMICompilationPlan(
+        tuple(fragments),
+        append_eos=not add_generation_prompt,
+        eos_is_assistant=side == "model",
+        assistant_only_loss=assistant_only_loss,
+    )
+
+
+def compile_smi_plan_batched(
+    tokenizer: Any,
+    plan: SMICompilationPlan,
+    *,
+    token_ids: Mapping[str, int] | None = None,
+) -> CompiledSMITraining:
+    """Compile a rendered plan with one batch call for distinct plaintext fragments.
+
+    Structural markers are inserted by token ID and are never passed through the
+    tokenizer. Non-callable lightweight tokenizers fall back to cached scalar
+    ``encode`` calls, one per distinct plaintext fragment.
+    """
+    ids = dict(token_ids or _installed_ids(tokenizer))
+    if set(ids) != set(SMI_TOKENS):
+        raise ValueError("token_ids must map exactly the ten SMI tokens")
+
+    plaintexts = list(
+        dict.fromkeys(
+            fragment.value
+            for fragment in plan.fragments
+            if fragment.kind == "plaintext"
+        )
+    )
+    encoded_plaintexts = _batch_encode_plaintexts(tokenizer, plaintexts)
+    cache = dict(zip(plaintexts, encoded_plaintexts, strict=True))
+    input_ids, labels, _ = _assemble_plan(
+        tokenizer, plan, ids, cache.__getitem__, include_assistant_mask=False
+    )
+    return CompiledSMITraining(input_ids, labels)
+
+
+def _compile_smi_plan_scalar(
+    tokenizer: Any,
+    plan: SMICompilationPlan,
+    token_ids: Mapping[str, int],
+) -> CompiledSMI:
+    input_ids, labels, assistant_mask = _assemble_plan(
+        tokenizer,
+        plan,
+        token_ids,
+        lambda text: _encode(tokenizer, text, split_special_tokens=True),
+        include_assistant_mask=True,
+    )
+    assert assistant_mask is not None
+    return CompiledSMI(input_ids, labels, assistant_mask)
+
+
+def _assemble_plan(
+    tokenizer: Any,
+    plan: SMICompilationPlan,
+    token_ids: Mapping[str, int],
+    encode_plaintext: Callable[[str], Sequence[int]],
+    *,
+    include_assistant_mask: bool,
+) -> tuple[list[int], list[int], list[int] | None]:
+    input_ids: list[int] = []
+    labels: list[int] = []
+    assistant_mask: list[int] | None = [] if include_assistant_mask else None
+
+    def append(encoded: Sequence[int], assistant: bool) -> None:
+        materialized = [int(token_id) for token_id in encoded]
+        input_ids.extend(materialized)
+        labels.extend(
+            materialized
+            if (not plan.assistant_only_loss or assistant)
+            else [-100] * len(materialized)
+        )
+        if assistant_mask is not None:
+            assistant_mask.extend([int(assistant)] * len(materialized))
+
+    for fragment in plan.fragments:
+        encoded = (
+            [token_ids[fragment.value]]
+            if fragment.kind == "structural"
+            else encode_plaintext(fragment.value)
+        )
+        append(encoded, fragment.assistant)
+
+    if plan.append_eos:
         eos_token_id = getattr(tokenizer, "eos_token_id", None)
         if eos_token_id is None:
             raise ValueError("tokenizer must define a native eos_token_id")
-        input_ids.append(int(eos_token_id))
-        assistant_mask.append(int(side == "model"))
+        append([int(eos_token_id)], plan.eos_is_assistant)
+    return input_ids, labels, assistant_mask
 
-    labels = [
-        token_id if (not assistant_only_loss or mask) else -100
-        for token_id, mask in zip(input_ids, assistant_mask, strict=True)
-    ]
-    return CompiledSMI(input_ids, labels, assistant_mask)
+
+def _batch_encode_plaintexts(tokenizer: Any, texts: list[str]) -> list[list[int]]:
+    if not texts:
+        return []
+    if not callable(tokenizer):
+        return [_encode(tokenizer, text, split_special_tokens=True) for text in texts]
+    try:
+        batch: Any = tokenizer(
+            texts,
+            add_special_tokens=False,
+            split_special_tokens=True,
+            padding=False,
+            truncation=False,
+        )
+    except TypeError as error:
+        raise TypeError(
+            "tokenizer batch call must support split_special_tokens for secure "
+            "compilation"
+        ) from error
+    encoded = batch["input_ids"]
+    if len(encoded) != len(texts):
+        raise ValueError("tokenizer batch call returned the wrong number of sequences")
+    return [[int(token_id) for token_id in sequence] for sequence in encoded]
 
 
 def _append_assistant(
