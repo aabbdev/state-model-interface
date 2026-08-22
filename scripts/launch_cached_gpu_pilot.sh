@@ -33,11 +33,15 @@ fi
 SMI_PILOT_SOURCE_CACHE="$source_cache" nohup smi-prepare-pilot \
     --output "$mixture" \
     --max-length 2048 \
-    --max-serialized-chars 32768 \
+    --max-serialized-chars 1000000 \
+    --max-raw-bytes 4000000 \
+    --max-raw-nodes 100000 \
+    --max-raw-depth 128 \
     --shuffle-buffer 10000 \
     --row-group-size 1024 \
     --workers 1 \
     --compile-batch-size 128 \
+    --tokenizer-timeout-seconds 30 \
     >"$data_root/smi-pilot-10m.prepare.log" 2>&1 &
 prepare_pid=$!
 echo "$prepare_pid" >"$prepare_pid_file"

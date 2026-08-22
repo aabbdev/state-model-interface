@@ -816,15 +816,19 @@ stores pinned `input_ids` and assistant-only `labels` beside the canonical JSON,
 the trainer validates and packs them directly instead of tokenizing the corpus twice.
 For a manifest written outside the default sidecar path, pass
 `--precompiled-manifest /path/to/manifest.json` to `smi-train-rwkv7`.
-It never reads evaluation splits. Pathological serialized rows are rejected before
-tokenization at `max_length * 16` characters by default; override this with
-`--max-serialized-chars`. Use repeatable `--quota SOURCE=TOKENS` options to make a
-smaller smoke mixture. Secure SMI compilation uses one stable worker by default;
+It never reads evaluation splits. A high one-million-character safety ceiling guards
+against structurally abusive rows without language-dependent byte heuristics; the
+semantic acceptance limit remains the exact tokenizer count of 2048 tokens.
+Use repeatable `--quota SOURCE=TOKENS` options to make a smaller smoke mixture.
+Secure SMI compilation uses one stable worker by default;
 bounded, order-preserving thread parallelism is available with `--workers`, but must
 be validated against the selected tokenizer before production use. Independently,
 `--compile-batch-size` defaults to 128 and combines plaintext fragments from many
 validated examples into one safe tokenizer batch without sharing a tokenizer across
-threads.
+threads. The production launcher additionally isolates that tokenizer in a supervised
+process with a 30-second hard timeout: a slow batch is bisected, the worker is
+restarted, and only a persistently failing singleton is rejected. This keeps context
+acceptance language-agnostic while preventing one row from stalling the corpus.
 
 For unreliable or rate-limited Hub access, cache immutable direct shards first:
 

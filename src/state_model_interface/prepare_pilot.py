@@ -25,6 +25,7 @@ from .compiler import (
     install_smi_tokens,
     render_smi_plan,
 )
+from .isolated_tokenizer import IsolatedSMIBatchCompiler, IsolatedSMICompilerError
 
 TOKENIZER = "aabbdev/RWKV7-1.5B-20260805"
 TOKENIZER_REVISION = "5904f9d1cdb05a565e5da9304db0447c8a8eb938"
@@ -112,6 +113,7 @@ DEFAULT_SOURCES: tuple[SourceSpec, ...] = (
             f"Nemotron-SFT-Agentic-v2/resolve/{NEMOTRON_REVISION}/"
             "data/tool_calling.jsonl"
         ),
+        ("messages", "tools"),
     ),
     SourceSpec(
         "hermes_func_calling",
@@ -532,7 +534,10 @@ def _single_url_rows(url: str, columns: Sequence[str] | None = None) -> Iterable
         ) as stream:
             for line in stream:
                 if line.strip():
-                    yield json.loads(line)
+                    row = json.loads(line)
+                    if columns is not None and isinstance(row, Mapping):
+                        row = {column: row.get(column) for column in columns}
+                    yield row
 
 
 def _cached_url_path(url: str, cache_root: Path) -> Path:
@@ -643,10 +648,19 @@ def _prepare_candidate(
     *,
     adapter: Adapter,
     max_serialized_chars: int,
+    max_raw_bytes: int,
+    max_raw_nodes: int,
+    max_raw_depth: int,
 ) -> PreparedCandidate:
     try:
         if not isinstance(row, Mapping):
             raise TypeError("row is not an object")
+        _validate_raw_budget(
+            row,
+            max_bytes=max_raw_bytes,
+            max_nodes=max_raw_nodes,
+            max_depth=max_raw_depth,
+        )
         messages, tools = adapter(row)
         canonical_messages = _canonical_json(messages)
         canonical_tools = _canonical_json(tools)
@@ -664,12 +678,65 @@ def _prepare_candidate(
         return PreparedCandidate("invalid")
 
 
+def _validate_raw_budget(
+    value: Any,
+    *,
+    max_bytes: int,
+    max_nodes: int,
+    max_depth: int,
+) -> None:
+    total_bytes = 0
+    nodes = 0
+    scheduled_nodes = 1
+    stack = [(value, 0, False)]
+    active_containers: set[int] = set()
+    while stack:
+        current, depth, exiting = stack.pop()
+        if exiting:
+            active_containers.remove(id(current))
+            continue
+        nodes += 1
+        if nodes > max_nodes or depth > max_depth:
+            raise ValueError("raw row exceeds structural budget")
+        if isinstance(current, str):
+            total_bytes += len(current.encode("utf-8"))
+        elif isinstance(current, bytes):
+            total_bytes += len(current)
+        elif isinstance(current, Mapping):
+            identity = id(current)
+            if identity in active_containers:
+                raise ValueError("raw row contains a cycle")
+            active_containers.add(identity)
+            child_count = len(current) * 2
+            if scheduled_nodes + child_count > max_nodes:
+                raise ValueError("raw row exceeds structural budget")
+            scheduled_nodes += child_count
+            stack.append((current, depth, True))
+            for key, item in current.items():
+                stack.append((key, depth + 1, False))
+                stack.append((item, depth + 1, False))
+        elif isinstance(current, Sequence):
+            identity = id(current)
+            if identity in active_containers:
+                raise ValueError("raw row contains a cycle")
+            active_containers.add(identity)
+            child_count = len(current)
+            if scheduled_nodes + child_count > max_nodes:
+                raise ValueError("raw row exceeds structural budget")
+            scheduled_nodes += child_count
+            stack.append((current, depth, True))
+            stack.extend((item, depth + 1, False) for item in current)
+        if total_bytes > max_bytes:
+            raise ValueError("raw row exceeds byte budget")
+
+
 def _compile_candidates(
     candidates: Sequence[PreparedCandidate],
     *,
     tokenizer: Any,
     token_ids: Mapping[str, int],
     max_length: int,
+    isolated_compiler: IsolatedSMIBatchCompiler | None = None,
 ) -> list[PreparedPilotRow]:
     results: list[PreparedPilotRow | None] = [None] * len(candidates)
     plans = []
@@ -691,15 +758,29 @@ def _compile_candidates(
         if not group_plans:
             return
         try:
-            compiled_group = compile_smi_plans_batched(
-                tokenizer,
-                group_plans,
-                token_ids=token_ids,
+            compiled_group = (
+                isolated_compiler.compile(group_plans)
+                if isolated_compiler is not None
+                else compile_smi_plans_batched(
+                    tokenizer,
+                    group_plans,
+                    token_ids=token_ids,
+                )
             )
-        except (KeyError, TypeError, ValueError, OverflowError, RecursionError):
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            OverflowError,
+            RecursionError,
+            IsolatedSMICompilerError,
+        ):
             if len(group_plans) == 1:
                 index = indices[0]
                 candidate = candidates[index]
+                if isolated_compiler is not None:
+                    results[index] = PreparedPilotRow("tokenizer_failure")
+                    return
                 try:
                     compiled_by_index[index] = compile_smi(
                         tokenizer,
@@ -791,8 +872,12 @@ def prepare(
     tokenizer: Any,
     max_length: int,
     max_serialized_chars: int | None = None,
+    max_raw_bytes: int | None = None,
+    max_raw_nodes: int = 100_000,
+    max_raw_depth: int = 128,
     workers: int = 1,
     compile_batch_size: int = 1,
+    tokenizer_timeout_seconds: float | None = None,
     seed: int,
     shuffle_buffer: int,
     row_group_size: int,
@@ -812,9 +897,17 @@ def prepare(
     ):
         raise ValueError("length and buffer sizes must be positive")
     if max_serialized_chars is None:
-        max_serialized_chars = max_length * 16
+        max_serialized_chars = 1_000_000
+    if max_raw_bytes is None:
+        max_raw_bytes = 4_000_000
     if max_serialized_chars <= 0:
         raise ValueError("max serialized characters must be positive")
+    if max_raw_bytes <= 0 or max_raw_nodes <= 0 or max_raw_depth <= 0:
+        raise ValueError("raw row budgets must be positive")
+    if tokenizer_timeout_seconds is not None and (
+        not math.isfinite(tokenizer_timeout_seconds) or tokenizer_timeout_seconds <= 0
+    ):
+        raise ValueError("tokenizer timeout must be finite and positive")
     if output.exists():
         raise FileExistsError(f"refusing to overwrite existing mixture: {output}")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -847,6 +940,11 @@ def prepare(
     total_rows = 0
     writer = pq.ParquetWriter(temporary_output, schema, compression="zstd")
     executor = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+    isolated_compiler = (
+        IsolatedSMIBatchCompiler(tokenizer_timeout_seconds)
+        if tokenizer_timeout_seconds is not None
+        else None
+    )
 
     def reject(source_name: str, reason: str) -> None:
         rejected = stats[source_name]["rejected"]
@@ -872,6 +970,9 @@ def prepare(
                 _prepare_candidate,
                 adapter=adapter,
                 max_serialized_chars=max_serialized_chars,
+                max_raw_bytes=max_raw_bytes,
+                max_raw_nodes=max_raw_nodes,
+                max_raw_depth=max_raw_depth,
             )
             prepared_candidates = (
                 map(prepare_candidate, rows)
@@ -905,6 +1006,7 @@ def prepare(
                     tokenizer=tokenizer,
                     token_ids=token_ids,
                     max_length=max_length,
+                    isolated_compiler=isolated_compiler,
                 )
                 compiled_by_fingerprint = {
                     candidate.fingerprint: prepared
@@ -953,6 +1055,12 @@ def prepare(
                     if stats[source.name]["target_tokens"] >= source.quota:
                         quota_reached = True
                         break
+                print(
+                    f"source {source.name}: heartbeat seen {source_seen}, accepted "
+                    f"{stats[source.name]['rows']} rows / "
+                    f"{stats[source.name]['target_tokens']} tokens",
+                    flush=True,
+                )
                 if quota_reached:
                     break
             close_prepared = getattr(prepared_candidates, "close", None)
@@ -968,6 +1076,8 @@ def prepare(
     finally:
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=True)
+        if isolated_compiler is not None:
+            isolated_compiler.close()
         writer.close()
 
     temporary_output.rename(output)
@@ -988,9 +1098,13 @@ def prepare(
         "tokenizer_revision": TOKENIZER_REVISION,
         "max_length": max_length,
         "max_serialized_chars": max_serialized_chars,
+        "max_raw_bytes": max_raw_bytes,
+        "max_raw_nodes": max_raw_nodes,
+        "max_raw_depth": max_raw_depth,
         "source_cache": os.environ.get("SMI_PILOT_SOURCE_CACHE"),
         "workers": workers,
         "compile_batch_size": compile_batch_size,
+        "tokenizer_timeout_seconds": tokenizer_timeout_seconds,
         "pretokenized": True,
         "assistant_only_loss": True,
         "preserve_thinking": True,
@@ -1021,13 +1135,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-serialized-chars",
         type=int,
-        help="reject pathological rows before tokenization (default: max-length * 16)",
+        help="high structural safety ceiling before exact tokenization (default: 1M)",
     )
+    parser.add_argument("--max-raw-bytes", type=int)
+    parser.add_argument("--max-raw-nodes", type=int, default=100_000)
+    parser.add_argument("--max-raw-depth", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--shuffle-buffer", type=int, default=10_000)
     parser.add_argument("--row-group-size", type=int, default=1024)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--compile-batch-size", type=int, default=128)
+    parser.add_argument("--tokenizer-timeout-seconds", type=float, default=30.0)
     parser.add_argument("--minimum-code-score", type=float, default=0.8)
     parser.add_argument(
         "--quota",
@@ -1061,8 +1179,12 @@ def main(argv: list[str] | None = None) -> None:
         tokenizer=tokenizer,
         max_length=args.max_length,
         max_serialized_chars=args.max_serialized_chars,
+        max_raw_bytes=args.max_raw_bytes,
+        max_raw_nodes=args.max_raw_nodes,
+        max_raw_depth=args.max_raw_depth,
         workers=args.workers,
         compile_batch_size=args.compile_batch_size,
+        tokenizer_timeout_seconds=args.tokenizer_timeout_seconds,
         seed=args.seed,
         shuffle_buffer=args.shuffle_buffer,
         row_group_size=args.row_group_size,

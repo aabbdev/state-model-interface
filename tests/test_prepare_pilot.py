@@ -21,6 +21,7 @@ from state_model_interface.prepare_pilot import (
     _digest_canonical,
     _quota_overrides,
     _source_rows,
+    _validate_raw_budget,
     adapt_aya,
     adapt_hermes,
     adapt_nemotron,
@@ -256,6 +257,7 @@ def test_cli_defaults_and_quota_validation() -> None:
     assert args.shuffle_buffer == 10_000
     assert args.workers == 1
     assert args.compile_batch_size == 128
+    assert args.tokenizer_timeout_seconds == 30.0
     assert args.minimum_code_score == 0.8
     assert _quota_overrides(["aya=12"]) == {"aya": 12}
     with pytest.raises(ValueError):
@@ -269,6 +271,32 @@ def test_canonical_digest_reuses_exact_serialized_fragments() -> None:
         json.dumps(messages, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
         json.dumps(tools, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
     ) == _digest(messages, tools)
+
+
+def test_raw_budget_allows_shared_values_but_rejects_cycles() -> None:
+    shared = {"text": "你好"}
+    _validate_raw_budget(
+        {"first": shared, "second": shared},
+        max_bytes=1_000,
+        max_nodes=100,
+        max_depth=10,
+    )
+    cyclic: dict[str, object] = {}
+    cyclic["self"] = cyclic
+    with pytest.raises(ValueError, match="cycle"):
+        _validate_raw_budget(
+            cyclic,
+            max_bytes=1_000,
+            max_nodes=100,
+            max_depth=10,
+        )
+    with pytest.raises(ValueError, match="structural budget"):
+        _validate_raw_budget(
+            {"items": list(range(1_000))},
+            max_bytes=1_000,
+            max_nodes=10,
+            max_depth=10,
+        )
 
 
 def test_direct_jsonl_rows_are_streamed_and_shuffled(tmp_path: Path) -> None:
@@ -290,6 +318,30 @@ def test_direct_jsonl_rows_are_streamed_and_shuffled(tmp_path: Path) -> None:
 
     assert sorted(row["value"] for row in rows) == list(range(5))
     assert [row["value"] for row in rows] != list(range(5))
+
+
+def test_direct_jsonl_projection_preserves_non_object_for_controlled_rejection(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "rows.jsonl"
+    source_path.write_text('[]\n{"value":7}\n')
+    source = SourceSpec(
+        "direct",
+        "offline/direct",
+        None,
+        "train",
+        "a" * 40,
+        "MIT",
+        1,
+        "aya",
+        source_path.as_uri(),
+        ("value",),
+    )
+
+    rows = list(_source_rows(source, seed=7, buffer_size=2))
+
+    assert [] in rows
+    assert {"value": 7} in rows
 
 
 def test_direct_parquet_rows_are_streamed(tmp_path: Path) -> None:
@@ -421,9 +473,10 @@ def test_prepare_writes_simple_parquet_and_manifest_offline(tmp_path: Path) -> N
     assert manifest["target_tokens"] == target_tokens
     assert manifest["format_version"] == 2
     assert manifest["pretokenized"] is True
-    assert manifest["max_serialized_chars"] == 16_000
+    assert manifest["max_serialized_chars"] == 1_000_000
     assert manifest["workers"] == 1
     assert manifest["compile_batch_size"] == 1
+    assert manifest["tokenizer_timeout_seconds"] is None
     assert len(manifest["output_sha256"]) == 64
     assert json.loads(manifest_path.read_text()) == manifest
     with pytest.raises(FileExistsError, match="overwrite"):
@@ -479,6 +532,7 @@ def test_prepare_rejects_oversized_text_before_tokenization(tmp_path: Path) -> N
         sources=[source],
         tokenizer=tokenizer,
         max_length=64,
+        max_serialized_chars=2_048,
         seed=7,
         shuffle_buffer=8,
         row_group_size=1,
